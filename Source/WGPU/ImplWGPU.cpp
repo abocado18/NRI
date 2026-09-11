@@ -1,8 +1,9 @@
 // © 2026 NVIDIA Corporation
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstdio>
-#include <string>
+#include <mutex>
 #include <thread>
 
 #include "SharedWGPU.h"
@@ -207,14 +208,14 @@ static Result NRI_CALL CreateTexture(Device& device, const TextureDesc& textureD
 
 static void NRI_CALL GetBufferMemoryDesc(const Buffer& buffer, MemoryLocation memoryLocation, MemoryDesc& memoryDesc) {
     const BufferDesc& bufferDesc = ((BufferWGPU&)buffer).GetDesc();
-    memoryDesc = {std::max(bufferDesc.size, 1ull), 1, (MemoryType)memoryLocation, false};
+    memoryDesc = {std::max<uint64_t>(bufferDesc.size, 1), 1, (MemoryType)memoryLocation, false};
 }
 
 static void NRI_CALL GetTextureMemoryDesc(const Texture& texture, MemoryLocation memoryLocation, MemoryDesc& memoryDesc) {
     const TextureDesc& textureDesc = ((TextureWGPU&)texture).GetDesc();
     uint64_t size = (uint64_t)textureDesc.width * std::max((Dim_t)1, textureDesc.height) * std::max((Dim_t)1, textureDesc.depth) * std::max((Dim_t)1, textureDesc.layerNum) * std::max((Dim_t)1, textureDesc.mipNum);
 
-    memoryDesc = {std::max(size, 1ull), 1, (MemoryType)memoryLocation, false};
+    memoryDesc = {std::max<uint64_t>(size, 1), 1, (MemoryType)memoryLocation, false};
 }
 
 static Result NRI_CALL BindBufferMemory(const BindBufferMemoryDesc* bindBufferMemoryDescs, uint32_t bindBufferMemoryDescNum) {
@@ -234,13 +235,13 @@ static Result NRI_CALL BindTextureMemory(const BindTextureMemoryDesc*, uint32_t)
 }
 
 static void NRI_CALL GetBufferMemoryDesc2(const Device&, const BufferDesc& bufferDesc, MemoryLocation memoryLocation, MemoryDesc& memoryDesc) {
-    memoryDesc = {std::max(bufferDesc.size, 1ull), 1, (MemoryType)memoryLocation, false};
+    memoryDesc = {std::max<uint64_t>(bufferDesc.size, 1), 1, (MemoryType)memoryLocation, false};
 }
 
 static void NRI_CALL GetTextureMemoryDesc2(const Device&, const TextureDesc& textureDesc, MemoryLocation memoryLocation, MemoryDesc& memoryDesc) {
     uint64_t size = (uint64_t)textureDesc.width * std::max((Dim_t)1, textureDesc.height) * std::max((Dim_t)1, textureDesc.depth) * std::max((Dim_t)1, textureDesc.layerNum) * std::max((Dim_t)1, textureDesc.mipNum);
 
-    memoryDesc = {std::max(size, 1ull), 1, (MemoryType)memoryLocation, false};
+    memoryDesc = {std::max<uint64_t>(size, 1), 1, (MemoryType)memoryLocation, false};
 }
 
 static Result NRI_CALL CreateCommittedBuffer(Device& device, MemoryLocation memoryLocation, float priority, const BufferDesc& bufferDesc, Buffer*& buffer) {
@@ -553,6 +554,14 @@ static void NRI_CALL UnmapBuffer(Buffer& buffer) {
     ((BufferWGPU&)buffer).Unmap();
 }
 
+static Result NRI_CALL UploadHostMemoryToTexture(Queue& queue, const UploadHostMemoryToTextureDesc* copyDescs, uint32_t copyDescNum) {
+    return ((QueueWGPU&)queue).GetDevice().UploadHostMemoryToTexture(copyDescs, copyDescNum);
+}
+
+static Result NRI_CALL ReadbackTextureToHostMemory(Queue& queue, const ReadbackTextureToHostMemoryDesc* copyDescs, uint32_t copyDescNum) {
+    return ((QueueWGPU&)queue).GetDevice().ReadbackTextureToHostMemory(copyDescs, copyDescNum);
+}
+
 static uint64_t NRI_CALL GetBufferDeviceAddress(const Buffer&) {
     // TODO: WebGPU does not expose buffer device addresses. Keep device-address/ray-tracing features disabled.
     return 0;
@@ -724,6 +733,8 @@ Result DeviceWGPU::FillFunctionTable(CoreInterface& table) const {
     table.ResetCommandAllocator = ::ResetCommandAllocator;
     table.MapBuffer = ::MapBuffer;
     table.UnmapBuffer = ::UnmapBuffer;
+    table.UploadHostMemoryToTexture = ::UploadHostMemoryToTexture;
+    table.ReadbackTextureToHostMemory = ::ReadbackTextureToHostMemory;
     table.GetBufferDeviceAddress = ::GetBufferDeviceAddress;
     table.SetDebugName = ::SetDebugName;
     table.GetDeviceNativeObject = ::GetDeviceNativeObject;
@@ -806,16 +817,16 @@ static void NRI_CALL DestroyImgui(Imgui* imgui) {
     Destroy((ImguiImpl*)imgui);
 }
 
-static void NRI_CALL CmdCopyImguiData(CommandBuffer& commandBuffer, Streamer& streamer, Imgui& imgui, const CopyImguiDataDesc& copyImguiDataDesc) {
+static void NRI_CALL CmdCopyImguiData(CommandBuffer& commandBuffer, Streamer& streamer, Imgui& imgui, const CopyImguiDataDesc& copyImguiDataDesc, ImguiRenderData& imguiRenderData) {
     ImguiImpl& imguiImpl = (ImguiImpl&)imgui;
 
-    return imguiImpl.CmdCopyData(commandBuffer, streamer, copyImguiDataDesc);
+    return imguiImpl.CmdCopyData(commandBuffer, streamer, copyImguiDataDesc, imguiRenderData);
 }
 
-static void NRI_CALL CmdDrawImgui(CommandBuffer& commandBuffer, Imgui& imgui, const DrawImguiDesc& drawImguiDesc) {
-    ImguiImpl& imguiImpl = (ImguiImpl&)imgui;
+static void NRI_CALL CmdDrawImgui(CommandBuffer& commandBuffer, const ImguiRenderData& imguiRenderData, const DrawImguiDesc& drawImguiDesc) {
+    ImguiImpl& imguiImpl = (ImguiImpl&)*imguiRenderData.imgui;
 
-    return imguiImpl.CmdDraw(commandBuffer, drawImguiDesc);
+    return imguiImpl.CmdDraw(commandBuffer, imguiRenderData, drawImguiDesc);
 }
 
 Result DeviceWGPU::FillFunctionTable(ImguiInterface& table) const {
@@ -885,12 +896,20 @@ static void NRI_CALL DestroyStreamer(Streamer* streamer) {
     Destroy((StreamerImpl*)streamer);
 }
 
+static StreamerCopyBatch NRI_CALL BeginStreamerCopyBatch(Streamer& streamer) {
+    return ((StreamerImpl&)streamer).BeginCopyBatch();
+}
+
 static Buffer* NRI_CALL GetStreamerConstantBuffer(Streamer& streamer) {
     return ((StreamerImpl&)streamer).GetConstantBuffer();
 }
 
 static uint32_t NRI_CALL StreamConstantData(Streamer& streamer, const void* data, uint32_t dataSize) {
     return ((StreamerImpl&)streamer).StreamConstantData(data, dataSize);
+}
+
+static void* NRI_CALL StreamHostData(Streamer& streamer, const void* data, uint64_t dataSize, uint32_t placementAlignment) {
+    return ((StreamerImpl&)streamer).StreamHostData(data, dataSize, placementAlignment);
 }
 
 static BufferOffset NRI_CALL StreamBufferData(Streamer& streamer, const StreamBufferDataDesc& streamBufferDataDesc) {
@@ -905,17 +924,19 @@ static void NRI_CALL EndStreamerFrame(Streamer& streamer) {
     ((StreamerImpl&)streamer).EndFrame();
 }
 
-static void NRI_CALL CmdCopyStreamedData(CommandBuffer& commandBuffer, Streamer& streamer) {
-    ((StreamerImpl&)streamer).CmdCopyStreamedData(commandBuffer);
+static void NRI_CALL CmdCopyStreamedData(CommandBuffer& commandBuffer, Streamer& streamer, StreamerCopyBatch copyBatch) {
+    ((StreamerImpl&)streamer).CmdCopyStreamedData(commandBuffer, copyBatch);
 }
 
 Result DeviceWGPU::FillFunctionTable(StreamerInterface& table) const {
     table.CreateStreamer = ::CreateStreamer;
     table.DestroyStreamer = ::DestroyStreamer;
+    table.BeginStreamerCopyBatch = ::BeginStreamerCopyBatch;
     table.GetStreamerConstantBuffer = ::GetStreamerConstantBuffer;
     table.StreamBufferData = ::StreamBufferData;
     table.StreamTextureData = ::StreamTextureData;
     table.StreamConstantData = ::StreamConstantData;
+    table.StreamHostData = ::StreamHostData;
     table.EndStreamerFrame = ::EndStreamerFrame;
     table.CmdCopyStreamedData = ::CmdCopyStreamedData;
 
@@ -947,11 +968,11 @@ static Result NRI_CALL AcquireNextTexture(SwapChain& swapChain, Fence&, uint32_t
     return ((SwapChainWGPU&)swapChain).AcquireNextTexture(textureIndex);
 }
 
-static Result NRI_CALL WaitForPresent(SwapChain& swapChain) {
+static Result NRI_CALL WaitForPresent(SwapChain& swapChain, uint64_t) {
     return ((SwapChainWGPU&)swapChain).WaitForPresent();
 }
 
-static Result NRI_CALL QueuePresent(SwapChain& swapChain, Fence&) {
+static Result NRI_CALL QueuePresent(SwapChain& swapChain, Fence&, uint64_t) {
     return ((SwapChainWGPU&)swapChain).Present();
 }
 

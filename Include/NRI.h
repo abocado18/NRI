@@ -38,8 +38,8 @@ Implicit:
 
 #pragma once
 
-#define NRI_VERSION 180
-#define NRI_VERSION_DATE "23 June 2026"
+#define NRI_VERSION 181
+#define NRI_VERSION_DATE "1 September 2026"
 
 // C/C++ compatible interface (auto-selection or via "NRI_FORCE_C" macro)
 #include "NRIDescs.h"
@@ -184,7 +184,7 @@ NriStruct(CoreInterface) {
         // Graphics
         void                (NRI_CALL *CmdBeginRendering)           (NriRef(CommandBuffer) commandBuffer, const NriRef(RenderingDesc) renderingDesc);
         // {                {
-            // Clear
+            // Clear ("rects" require the corresponding "features.rectColorClears" or "features.rectDepthStencilClears")
             void                (NRI_CALL *CmdClearAttachments)     (NriRef(CommandBuffer) commandBuffer, const NriPtr(ClearAttachmentDesc) clearAttachmentDescs, uint32_t clearAttachmentDescNum, const NriPtr(Rect) rects, uint32_t rectNum);
 
             // Draw
@@ -256,8 +256,15 @@ NriStruct(CoreInterface) {
     void*               (NRI_CALL *MapBuffer)                       (NriRef(Buffer) buffer, uint64_t offset, uint64_t size);
     void                (NRI_CALL *UnmapBuffer)                     (NriRef(Buffer) buffer);
 
-    // Device address (aka GPU virtual address)
-    // D3D11: returns "0"
+    // Synchronous host copies
+    // - all prior GPU access to the copied subresources must be complete before the call
+    // - host memory is no longer accessed and readback data is available after the call returns
+    // - textures must be created with "TextureUsageBits::HOST_TRANSFER"
+    // - destination regions in a single "UploadHostMemoryToTexture" call must not overlap
+    Nri(Result)         (NRI_CALL *UploadHostMemoryToTexture)       (NriRef(Queue) queue, const NriPtr(UploadHostMemoryToTextureDesc) copyDescs, uint32_t copyDescNum);
+    Nri(Result)         (NRI_CALL *ReadbackTextureToHostMemory)     (NriRef(Queue) queue, const NriPtr(ReadbackTextureToHostMemoryDesc) copyDescs, uint32_t copyDescNum);
+
+    // Device address (aka GPU virtual address or "0" if unsupported)
     uint64_t            (NRI_CALL *GetBufferDeviceAddress)          (const NriRef(Buffer) buffer);
 
     // Pipeline cache (PSO blob storage, persisted across runs)
@@ -271,7 +278,7 @@ NriStruct(CoreInterface) {
     // Native objects                                                                                            ___D3D11 (latest interface)________|_D3D12 (latest interface)____|_VK_________________________________|_WGPU__________________________________
     void*               (NRI_CALL *GetDeviceNativeObject)           (const NriPtr(Device) device);               // ID3D11Device*                   | ID3D12Device*               | VkDevice                           | WGPUDevice
     void*               (NRI_CALL *GetQueueNativeObject)            (const NriPtr(Queue) queue);                 // -                               | ID3D12CommandQueue*         | VkQueue                            | WGPUQueue
-    void*               (NRI_CALL *GetCommandBufferNativeObject)    (const NriPtr(CommandBuffer) commandBuffer); // ID3D11DeviceContext*            | ID3D12GraphicsCommandList*  | VkCommandBuffer                    | WGPUCommandBuffer
+    void*               (NRI_CALL *GetCommandBufferNativeObject)    (const NriPtr(CommandBuffer) commandBuffer); // ID3D11DeviceContext*            | ID3D12CommandList*          | VkCommandBuffer                    | WGPUCommandBuffer
     uint64_t            (NRI_CALL *GetBufferNativeObject)           (const NriPtr(Buffer) buffer);               // ID3D11Buffer*                   | ID3D12Resource*             | VkBuffer                           | WGPUBuffer
     uint64_t            (NRI_CALL *GetTextureNativeObject)          (const NriPtr(Texture) texture);             // ID3D11Resource*                 | ID3D12Resource*             | VkImage                            | WGPUTexture
     uint64_t            (NRI_CALL *GetDescriptorNativeObject)       (const NriPtr(Descriptor) descriptor);       // ID3D11View/ID3D11SamplerState*  | D3D12_CPU_DESCRIPTOR_HANDLE | VkImageView/VkBufferView/VkSampler | WGPUTextureView/WGPUBuffer/WGPUSampler

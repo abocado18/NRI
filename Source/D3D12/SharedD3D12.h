@@ -3,6 +3,9 @@
 #pragma once
 
 #include <d3d12.h>
+#include <d3d12video.h>
+#include <dxva.h>
+#include <d3d12sdklayers.h>
 #include <pix.h>
 
 // Validate Windows SDK version
@@ -38,6 +41,7 @@ struct D3D12_RAYTRACING_OPACITY_MICROMAP_HISTOGRAM_ENTRY {
 #endif
 
 #include "SharedExternal.h"
+#include "VideoHelpersD3D12.h"
 
 namespace nri {
 
@@ -61,6 +65,7 @@ struct QueryPoolD3D12;
 struct QueueD3D12;
 struct SwapChainD3D12;
 struct TextureD3D12;
+struct TransferContextD3D12;
 
 typedef size_t DescriptorHandleCPU;   // D3D12_CPU_DESCRIPTOR_HANDLE
 typedef uint64_t DescriptorHandleGPU; // D3D12_GPU_DESCRIPTOR_HANDLE
@@ -97,14 +102,20 @@ enum DescriptorHeapType : uint8_t {
 struct DescriptorHandle {
     uint32_t heapType : DESCRIPTOR_HANDLE_HEAP_TYPE_BIT_NUM;
     uint32_t heapIndex : DESCRIPTOR_HANDLE_HEAP_INDEX_BIT_NUM;
-    uint32_t heapOffset : DESCRIPTOR_HANDLE_HEAP_OFFSET_BIT_NUM;
+    uint32_t heapOffsetPlusOne : DESCRIPTOR_HANDLE_HEAP_OFFSET_BIT_NUM; // 0 is reserved for an invalid handle
+
+    inline bool IsAllocated() const {
+        return heapOffsetPlusOne != 0;
+    }
 };
 
 constexpr uint32_t DESCRIPTORS_BATCH_SIZE = 1024;
 constexpr uint32_t ROOT_CONSTANT_UNUSED = uint32_t(-1);
+constexpr uint32_t DRED_BREADCRUMB_HISTORY_MAX_NUM = 64 * 1024;
+constexpr uint32_t DRED_BREADCRUMB_RADIUS = 4;
 
 static_assert(D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES <= (1 << DESCRIPTOR_HANDLE_HEAP_TYPE_BIT_NUM), "Out of bounds");
-static_assert(DESCRIPTORS_BATCH_SIZE <= (1 << DESCRIPTOR_HANDLE_HEAP_OFFSET_BIT_NUM), "Out of bounds");
+static_assert(DESCRIPTORS_BATCH_SIZE < (1 << DESCRIPTOR_HANDLE_HEAP_OFFSET_BIT_NUM), "Out of bounds");
 
 struct DescriptorHeapDesc {
     ComPtr<ID3D12DescriptorHeap> heap;
@@ -117,6 +128,10 @@ struct DescriptorHeapDesc {
 inline uint32_t GetSubresourceIndex(uint32_t layerOffset, uint32_t resourceLayerNum, uint32_t mipOffset, uint32_t resourceMipNum, PlaneBits planes) {
     // https://learn.microsoft.com/en-us/windows/win32/direct3d12/subresources#plane-slice
     uint32_t planeIndex = 0;
+    if ((planes & PlaneBits::PLANE_1) != 0)
+        planeIndex = 1;
+    if ((planes & PlaneBits::PLANE_2) != 0)
+        planeIndex = 2;
     if (planes == PlaneBits::ALL || (planes & PlaneBits::STENCIL) != 0)
         planeIndex = 1;
     if (planes == PlaneBits::ALL || (planes & PlaneBits::DEPTH) != 0) // fallthrough
@@ -127,7 +142,7 @@ inline uint32_t GetSubresourceIndex(uint32_t layerOffset, uint32_t resourceLayer
     return mipOffset + (layerOffset + planeIndex * resourceLayerNum) * resourceMipNum;
 }
 
-void ConvertBotomLevelGeometries(const BottomLevelGeometryDesc* geometries, uint32_t geometryNum,
+void ConvertBottomLevelGeometries(const BottomLevelGeometryDesc* geometries, uint32_t geometryNum,
     D3D12_RAYTRACING_GEOMETRY_DESC* geometryDescs,
     D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC* triangleDescs,
     D3D12_RAYTRACING_GEOMETRY_OMM_LINKAGE_DESC* micromapDescs);
@@ -153,7 +168,7 @@ D3D12_CULL_MODE GetCullMode(CullMode cullMode);
 D3D12_STENCIL_OP GetStencilOp(StencilOp stencilFunc);
 UINT8 GetRenderTargetWriteMask(ColorWriteBits colorWriteMask);
 D3D12_LOGIC_OP GetLogicOp(LogicOp logicOp);
-D3D12_BLEND GetBlend(BlendFactor blendFactor);
+D3D12_BLEND GetBlend(BlendFactor blendFactor, bool isAlphaBlend);
 D3D12_BLEND_OP GetBlendOp(BlendOp blendFunc);
 D3D12_DESCRIPTOR_RANGE_TYPE GetDescriptorRangesType(DescriptorType descriptorType);
 D3D12_RESOURCE_DIMENSION GetResourceDimension(TextureType textureType);

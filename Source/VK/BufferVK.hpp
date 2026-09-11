@@ -14,8 +14,11 @@ BufferVK::~BufferVK() {
 Result BufferVK::Create(const BufferDesc& bufferDesc) {
     m_Desc = bufferDesc;
 
+    if ((bufferDesc.usage & (BufferUsageBits::VIDEO_DECODE | BufferUsageBits::VIDEO_ENCODE)) && !m_Device.m_IsSupported.videoMaintenance1)
+        return Result::UNSUPPORTED;
+
     VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    m_Device.FillCreateInfo(bufferDesc, info);
+    FillCreateInfo(info);
 
     const auto& vk = m_Device.GetDispatchTable();
     VkResult vkResult = vk.CreateBuffer(m_Device, &info, m_Device.GetVkAllocationCallbacks(), &m_Handle);
@@ -52,6 +55,42 @@ Result BufferVK::AllocateAndBindMemory(MemoryLocation memoryLocation, float prio
     memoryRequirements.alignment = memoryDesc.alignment; // can't use "vmaAllocateMemoryForBuffer" because of alignment (see "GetMemoryDesc")
     memoryRequirements.memoryTypeBits = 1u << memoryTypeInfo.index;
 
+    const bool isVideoOnly = IsVideoOnly();
+    if (isVideoOnly) {
+        VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        FillCreateInfo(info);
+
+        const auto& vk = m_Device.GetDispatchTable();
+        vk.DestroyBuffer(m_Device, m_Handle, m_Device.GetVkAllocationCallbacks());
+        m_Handle = VK_NULL_HANDLE;
+
+        // Use vmaCreateBuffer() so VMA sees the video usage flags before allocating. Generic
+        // vmaAllocateMemory() lacks buffer usage context and can select a block with
+        // buffer-device-address allocation flags, which video bitstream buffers do not need.
+        VmaAllocationCreateInfo allocationCreateInfo = {};
+        allocationCreateInfo.flags = VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT | VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+        allocationCreateInfo.flags |= IsHostVisibleMemory(memoryTypeInfo.location) ? VMA_ALLOCATION_CREATE_MAPPED_BIT : 0;
+        allocationCreateInfo.priority = priority * 0.5f + 0.5f;
+        allocationCreateInfo.memoryTypeBits = 1 << memoryTypeInfo.index;
+        allocationCreateInfo.minAlignment = memoryDesc.alignment;
+
+        VmaAllocationInfo allocationInfo = {};
+
+        VkResult vkResult = vmaCreateBuffer(m_Device.GetVma(), &info, &allocationCreateInfo, &m_Handle, &m_VmaAllocation, &allocationInfo);
+        NRI_RETURN_ON_BAD_VKRESULT(&m_Device, vkResult, "vmaCreateBuffer");
+
+        if (IsHostVisibleMemory(memoryTypeInfo.location)) {
+            m_MappedMemory = (uint8_t*)allocationInfo.pMappedData;
+
+            if (!m_Device.IsHostCoherentMemory(memoryTypeInfo.index)) {
+                m_NonCoherentDeviceMemory = allocationInfo.deviceMemory;
+                m_NonCoherentDeviceMemoryOffset = allocationInfo.offset;
+            }
+        }
+
+        return Result::SUCCESS;
+    }
+
     VmaAllocationCreateInfo allocationCreateInfo = {};
     allocationCreateInfo.flags = VMA_ALLOCATION_CREATE_STRATEGY_MIN_MEMORY_BIT;
     allocationCreateInfo.flags |= committed ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : VMA_ALLOCATION_CREATE_CAN_ALIAS_BIT;
@@ -78,7 +117,7 @@ Result BufferVK::AllocateAndBindMemory(MemoryLocation memoryLocation, float prio
     }
 
     // Get device address
-    if (m_Device.m_IsSupported.deviceAddress) {
+    if (m_Device.m_IsSupported.deviceAddress && !isVideoOnly) {
         VkBufferDeviceAddressInfo bufferDeviceAddressInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         bufferDeviceAddressInfo.buffer = m_Handle;
 
@@ -121,7 +160,7 @@ Result BufferVK::BindMemory(MemoryVK& memory, uint64_t offset, bool bindMemory) 
     }
 
     // Get device address
-    if (m_Device.m_IsSupported.deviceAddress) {
+    if (m_Device.m_IsSupported.deviceAddress && !IsVideoOnly()) {
         VkBufferDeviceAddressInfo bufferDeviceAddressInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         bufferDeviceAddressInfo.buffer = m_Handle;
 
@@ -130,6 +169,17 @@ Result BufferVK::BindMemory(MemoryVK& memory, uint64_t offset, bool bindMemory) 
     }
 
     return Result::SUCCESS;
+}
+
+bool BufferVK::IsVideoOnly() const {
+    constexpr uint32_t videoUsageMask = (uint32_t)BufferUsageBits::VIDEO_DECODE | (uint32_t)BufferUsageBits::VIDEO_ENCODE;
+    const uint32_t usageMask = (uint32_t)m_Desc.usage;
+
+    return (usageMask & videoUsageMask) != 0 && (usageMask & ~videoUsageMask) == 0;
+}
+
+void BufferVK::FillCreateInfo(VkBufferCreateInfo& info) const {
+    m_Device.FillCreateInfo(m_Desc, info);
 }
 
 void BufferVK::GetMemoryDesc(MemoryLocation memoryLocation, MemoryDesc& memoryDesc) const {
@@ -145,13 +195,27 @@ void BufferVK::GetMemoryDesc(MemoryLocation memoryLocation, MemoryDesc& memoryDe
     vk.GetBufferMemoryRequirements2(m_Device, &bufferMemoryRequirements, &requirements);
 
     // There is no "VK_BUFFER_USAGE" flag for "SCRATCH_BUFFER", thus "vkGetBufferMemoryRequirements" can't return proper alignment. It affects memory "sub-allocation"
-    if (m_Desc.usage & BufferUsageBits::SCRATCH_BUFFER) {
+    if (m_Desc.usage & BufferUsageBits::SCRATCH) {
         VkDeviceSize scratchBufferOffset = m_Device.GetDesc().memoryAlignment.scratchBufferOffset;
         requirements.memoryRequirements.alignment = std::max(requirements.memoryRequirements.alignment, scratchBufferOffset);
     }
 
     memoryDesc = {};
     m_Device.GetMemoryDesc(memoryLocation, requirements.memoryRequirements, dedicatedRequirements, memoryDesc);
+}
+
+VkMappedMemoryRange BufferVK::GetNonCoherentMappedMemoryRange(uint64_t offset, uint64_t size) const {
+    uint64_t atomSize = m_Device.GetNonCoherentAtomSize();
+    uint64_t rangeBegin = m_NonCoherentDeviceMemoryOffset + offset;
+    uint64_t rangeEnd = rangeBegin + size;
+    uint64_t bufferEnd = m_NonCoherentDeviceMemoryOffset + m_Desc.size;
+
+    VkMappedMemoryRange memoryRange = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+    memoryRange.memory = m_NonCoherentDeviceMemory;
+    memoryRange.offset = rangeBegin & ~(atomSize - 1);
+    memoryRange.size = (bufferEnd - rangeEnd < atomSize) ? VK_WHOLE_SIZE : (Align(rangeEnd, atomSize) - memoryRange.offset);
+
+    return memoryRange;
 }
 
 NRI_INLINE void BufferVK::SetDebugName(const char* name) {
@@ -167,18 +231,39 @@ NRI_INLINE void* BufferVK::Map(uint64_t offset, uint64_t size) {
     m_MappedMemoryRangeSize = size;
     m_MappedMemoryRangeOffset = offset;
 
+    if (m_NonCoherentDeviceMemory) {
+        VkResult vkResult = VK_SUCCESS;
+        if (m_VmaAllocation)
+            vkResult = vmaInvalidateAllocation(m_Device.GetVma(), m_VmaAllocation, offset, size);
+        else {
+            VkMappedMemoryRange memoryRange = GetNonCoherentMappedMemoryRange(offset, size);
+
+            const auto& vk = m_Device.GetDispatchTable();
+            vkResult = vk.InvalidateMappedMemoryRanges(m_Device, 1, &memoryRange);
+        }
+
+        if (vkResult < 0) {
+            Result result = GetResultFromVkResult(vkResult);
+            m_Device.ReportMessage(Message::ERROR, result, __FILE__, __LINE__, "vkInvalidateMappedMemoryRanges(): failed, result = 0x%08X (%d)!", vkResult, vkResult);
+            return nullptr;
+        }
+    }
+
     return m_MappedMemory + offset;
 }
 
 NRI_INLINE void BufferVK::Unmap() {
     if (m_NonCoherentDeviceMemory) {
-        VkMappedMemoryRange memoryRange = {VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
-        memoryRange.memory = m_NonCoherentDeviceMemory;
-        memoryRange.offset = m_NonCoherentDeviceMemoryOffset + m_MappedMemoryRangeOffset;
-        memoryRange.size = m_MappedMemoryRangeSize;
+        VkResult vkResult = VK_SUCCESS;
+        if (m_VmaAllocation)
+            vkResult = vmaFlushAllocation(m_Device.GetVma(), m_VmaAllocation, m_MappedMemoryRangeOffset, m_MappedMemoryRangeSize);
+        else {
+            VkMappedMemoryRange memoryRange = GetNonCoherentMappedMemoryRange(m_MappedMemoryRangeOffset, m_MappedMemoryRangeSize);
 
-        const auto& vk = m_Device.GetDispatchTable();
-        VkResult vkResult = vk.FlushMappedMemoryRanges(m_Device, 1, &memoryRange);
+            const auto& vk = m_Device.GetDispatchTable();
+            vkResult = vk.FlushMappedMemoryRanges(m_Device, 1, &memoryRange);
+        }
+
         NRI_RETURN_VOID_ON_BAD_VKRESULT(&m_Device, vkResult, "vkFlushMappedMemoryRanges");
     }
 }

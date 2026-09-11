@@ -8,6 +8,7 @@
 #include <numeric>   // lcm
 
 #include <array>
+#include <limits>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -36,14 +37,20 @@ typedef uint32_t DXGI_FORMAT;
 #include "Extensions/NRIStreamer.h"
 #include "Extensions/NRISwapChain.h"
 #include "Extensions/NRIUpscaler.h"
+#include "Extensions/NRIVideo.h"
 #include "Extensions/NRIWrapperD3D11.h"
 #include "Extensions/NRIWrapperD3D12.h"
 #include "Extensions/NRIWrapperVK.h"
 
 #include "Lock.h"
+#include "SharedVideo.h"
 
 // NRI default settings (if not provided in "NRIConfig.h")
-#include "../NRIConfig.h"
+#ifdef NRI_USER_CONFIG
+#    include NRI_USER_CONFIG
+#else
+#    include "../NRIConfig.h"
+#endif
 
 #ifndef NRI_TIMEOUT_PRESENT
 #    define NRI_TIMEOUT_PRESENT 1000u // 1 sec
@@ -83,6 +90,15 @@ typedef uint32_t DXGI_FORMAT;
 
 #ifndef NRI_INLINE
 #    define NRI_INLINE inline
+#endif
+
+// FFX default settings (if not provided in "NRIConfig.h")
+#ifndef NRI_FFX_DEBUG_LOG
+#    define NRI_FFX_DEBUG_LOG(messageType, message) \
+        do { \
+            MaybeUnused(messageType); \
+            wprintf(L"FFX: %ls\n", message); \
+        } while (false)
 #endif
 
 // D3D12MA default settings (if not provided in "NRIConfig.h")
@@ -298,14 +314,15 @@ protected:
         return returnCode; \
     }
 
-#define NRI_REPORT_INFO(deviceBase, format, ...)    (deviceBase)->ReportMessage(Message::INFO, Result::SUCCESS, __FILE__, __LINE__, format, ##__VA_ARGS__)
-#define NRI_REPORT_WARNING(deviceBase, format, ...) (deviceBase)->ReportMessage(Message::WARNING, Result::SUCCESS, __FILE__, __LINE__, "%s(): " format, __FUNCTION__, ##__VA_ARGS__)
-#define NRI_REPORT_ERROR(deviceBase, format, ...)   (deviceBase)->ReportMessage(Message::ERROR, Result::FAILURE, __FILE__, __LINE__, "%s(): " format, __FUNCTION__, ##__VA_ARGS__)
+#define NRI_REPORT_INFO(deviceBase, format, ...)              (deviceBase)->ReportMessage(Message::INFO, Result::SUCCESS, __FILE__, __LINE__, format, ##__VA_ARGS__)
+#define NRI_REPORT_WARNING(deviceBase, format, ...)           (deviceBase)->ReportMessage(Message::WARNING, Result::SUCCESS, __FILE__, __LINE__, "%s(): " format, __FUNCTION__, ##__VA_ARGS__)
+#define NRI_REPORT_ERROR(deviceBase, format, ...)             (deviceBase)->ReportMessage(Message::ERROR, Result::FAILURE, __FILE__, __LINE__, "%s(): " format, __FUNCTION__, ##__VA_ARGS__)
+#define NRI_REPORT_DEVICE_LOST_INFO(deviceBase, format, ...)  (deviceBase)->ReportMessage(Message::INFO, Result::DEVICE_LOST, __FILE__, __LINE__, format, ##__VA_ARGS__)
 
 // Array validation
 #define NRI_VALIDATE_ARRAY(x)                 static_assert((size_t)x[x.size() - 1] != 0, "Some elements are missing in '" NRI_STRINGIFY(x) "'");
 #define NRI_VALIDATE_ARRAY_BY_PTR(x)          static_assert(x[x.size() - 1] != nullptr, "Some elements are missing in '" NRI_STRINGIFY(x) "'");
-#define NRI_VALIDATE_ARRAY_BY_FIELD(x, field) static_assert(x[x.size() - 1].field != 0, "Some elements are missing in '" NRI_STRINGIFY(x) "'");
+#define NRI_VALIDATE_ARRAY_BY_FIELD(x, field) static_assert(x[x.size() - 1].field != decltype(x[x.size() - 1].field){}, "Some elements are missing in '" NRI_STRINGIFY(x) "'");
 
 // D3D
 #define NRI_SET_D3D_DEBUG_OBJECT_NAME(obj, name) \
@@ -329,7 +346,7 @@ namespace nri {
 // Internal consts
 constexpr uint32_t NODE_MASK = 0x1;               // mGPU is not planned
 constexpr uint32_t ROOT_SIGNATURE_DWORD_NUM = 64; // https://learn.microsoft.com/en-us/windows/win32/direct3d12/root-signature-limits
-constexpr uint64_t PRESENT_INDEX_BIT_NUM = 56ull;
+constexpr uint64_t MAX_CACHED_HOST_COPY_RESOURCE_SIZE = 64 * 1024 * 1024;
 
 // Scratch
 template <typename T>
@@ -376,6 +393,29 @@ inline T Align(T x, size_t alignment) {
     return (T)((size_t(x) + alignment - 1) & ~(alignment - 1));
 }
 
+inline void CopyTextureData(void* dstData, uint64_t dstRowPitch, uint64_t dstSlicePitch, const void* srcData, uint64_t srcRowPitch, uint64_t srcSlicePitch, uint64_t rowSize, uint32_t rowNum, uint32_t sliceNum) {
+    uint8_t* dst = (uint8_t*)dstData;
+    const uint8_t* src = (const uint8_t*)srcData;
+    uint64_t sliceSize = rowSize * rowNum;
+
+    if (dstRowPitch == rowSize && srcRowPitch == rowSize) {
+        if (dstSlicePitch == sliceSize && srcSlicePitch == sliceSize) {
+            memcpy(dst, src, (size_t)(sliceSize * sliceNum));
+            return;
+        }
+
+        for (uint32_t z = 0; z < sliceNum; z++)
+            memcpy(dst + uint64_t(z) * dstSlicePitch, src + uint64_t(z) * srcSlicePitch, (size_t)sliceSize);
+
+        return;
+    }
+
+    for (uint32_t z = 0; z < sliceNum; z++) {
+        for (uint32_t y = 0; y < rowNum; y++)
+            memcpy(dst + uint64_t(z) * dstSlicePitch + uint64_t(y) * dstRowPitch, src + uint64_t(z) * srcSlicePitch + uint64_t(y) * srcRowPitch, (size_t)rowSize);
+    }
+}
+
 template <typename... Args>
 constexpr void MaybeUnused([[maybe_unused]] const Args&... args) {
 }
@@ -408,8 +448,10 @@ inline T* Allocate(const AllocationCallbacks& allocationCallbacks, Args&&... arg
 template <typename T>
 inline void Destroy(const AllocationCallbacks& allocationCallbacks, T* object) {
     if (object) {
+        // FIXED BY AI: Preserve callbacks before destruction invalidates object-backed references.
+        const AllocationCallbacks allocationCallbacksCopy = allocationCallbacks;
         object->~T();
-        allocationCallbacks.Free(allocationCallbacks.userArg, object);
+        allocationCallbacksCopy.Free(allocationCallbacksCopy.userArg, object);
     }
 }
 
@@ -418,6 +460,10 @@ constexpr uint64_t MsToUs(uint32_t x) {
 }
 
 constexpr void ReturnVoid() {
+}
+
+static inline bool IsAligned(uint64_t value, uint64_t alignment) {
+    return alignment <= 1 || value % alignment == 0;
 }
 
 // Allocator
@@ -560,13 +606,6 @@ inline bool CompareUid(const Uid_t& a, const Uid_t& b) {
 void ConvertCharToWchar(const char* in, wchar_t* out, size_t outLen);
 void ConvertWcharToChar(const wchar_t* in, char* out, size_t outLen);
 
-// Swap chain ID
-uint64_t GetSwapChainId();
-
-inline uint64_t GetPresentIndex(uint64_t presentId) {
-    return presentId & ((1ull << PRESENT_INDEX_BIT_NUM) - 1ull);
-}
-
 // Windows/D3D specific
 #if (NRI_ENABLE_D3D11_SUPPORT || NRI_ENABLE_D3D12_SUPPORT)
 
@@ -600,6 +639,8 @@ struct DisplayDescHelper {
 
 struct QueueFamilyProps {
     uint32_t queueCount;
+    uint32_t videoDecodeCodecNum;
+    uint32_t videoEncodeCodecNum;
     bool graphics;
     bool compute;
     bool copy;
@@ -638,6 +679,26 @@ inline QueueType TrySelectPreferredQueueType(const QueueFamilyProps& props, std:
         if (props.copy && score > scores[index]) {
             scores[index] = score;
             return QueueType::COPY;
+        }
+    }
+
+    { // Prefer the most video decode codecs, then more queues
+        size_t index = (size_t)QueueType::VIDEO_DECODE;
+        uint32_t score = props.videoDecodeCodecNum * 100000 + props.queueCount * 100 + (!props.graphics ? 10 : 0) + (!props.compute ? 10 : 0) + (!props.copy ? 10 : 0) + (props.sparse ? 5 : 0) + (props.videoDecode ? 100 * props.queueCount : 0) + (!props.videoEncode ? 2 : 0) + (props.protect ? 1 : 0) + (!props.opticalFlow ? 1 : 0);
+
+        if (props.videoDecode && score > scores[index]) {
+            scores[index] = score;
+            return QueueType::VIDEO_DECODE;
+        }
+    }
+
+    { // Prefer the most video encode codecs, then more queues
+        size_t index = (size_t)QueueType::VIDEO_ENCODE;
+        uint32_t score = props.videoEncodeCodecNum * 100000 + props.queueCount * 100 + (!props.graphics ? 10 : 0) + (!props.compute ? 10 : 0) + (!props.copy ? 10 : 0) + (props.sparse ? 5 : 0) + (!props.videoDecode ? 2 : 0) + (props.videoEncode ? 100 * props.queueCount : 0) + (props.protect ? 1 : 0) + (!props.opticalFlow ? 1 : 0);
+
+        if (props.videoEncode && score > scores[index]) {
+            scores[index] = score;
+            return QueueType::VIDEO_ENCODE;
         }
     }
 

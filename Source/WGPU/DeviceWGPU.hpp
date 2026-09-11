@@ -1,22 +1,29 @@
 // © 2026 NVIDIA Corporation
 
-struct RequestAdapterContext {
-    WGPUAdapter adapter = nullptr;
-    WGPURequestAdapterStatus status = WGPURequestAdapterStatus_Error;
-    bool done = false;
-};
-
 struct RequestDeviceContext {
     WGPUDevice device = nullptr;
     WGPURequestDeviceStatus status = WGPURequestDeviceStatus_Error;
     bool done = false;
 };
 
-static void OnAdapterRequested(WGPURequestAdapterStatus status, WGPUAdapter adapter, WGPUStringView, void* userdata1, void*) {
-    RequestAdapterContext& context = *(RequestAdapterContext*)userdata1;
-    context.status = status;
-    context.adapter = adapter;
-    context.done = true;
+static inline bool IsSameAdapter(const AdapterDesc& adapterDesc, const WGPUAdapterInfo& adapterInfo) {
+
+    if (adapterDesc.vendor != Vendor::UNKNOWN && adapterDesc.deviceId && adapterInfo.vendorID && adapterInfo.deviceID)
+        return adapterDesc.vendor == GetVendorFromID(adapterInfo.vendorID) && adapterDesc.deviceId == adapterInfo.deviceID;
+
+    size_t nameLength = strlen(adapterDesc.name);
+
+    return adapterInfo.device.data && adapterInfo.device.length == nameLength && memcmp(adapterInfo.device.data, adapterDesc.name, nameLength) == 0;
+}
+
+static inline bool IsAdapterSupported(WGPUAdapter adapter) {
+
+    if (wgpuAdapterHasFeature(adapter, (WGPUFeatureName)WGPUNativeFeature_Immediates) != WGPU_TRUE)
+        return false;
+
+    WGPULimits limits = WGPU_LIMITS_INIT;
+
+    return wgpuAdapterGetLimits(adapter, &limits) == WGPUStatus_Success && limits.maxImmediateSize >= 256;
 }
 
 static void OnDeviceRequested(WGPURequestDeviceStatus status, WGPUDevice device, WGPUStringView, void* userdata1, void*) {
@@ -34,19 +41,117 @@ static void WaitForAsyncRequest(WGPUInstance instance, const bool& done) {
     }
 }
 
+static bool IsBCFormat(Format format) {
+    switch (format) {
+        case Format::BC1_RGBA_UNORM:
+        case Format::BC1_RGBA_SRGB:
+        case Format::BC2_RGBA_UNORM:
+        case Format::BC2_RGBA_SRGB:
+        case Format::BC3_RGBA_UNORM:
+        case Format::BC3_RGBA_SRGB:
+        case Format::BC4_R_UNORM:
+        case Format::BC4_R_SNORM:
+        case Format::BC5_RG_UNORM:
+        case Format::BC5_RG_SNORM:
+        case Format::BC6H_RGB_UFLOAT:
+        case Format::BC6H_RGB_SFLOAT:
+        case Format::BC7_RGBA_UNORM:
+        case Format::BC7_RGBA_SRGB:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool IsETC2Format(Format format) {
+    switch (format) {
+        case Format::ETC2_RGB8_UNORM:
+        case Format::ETC2_RGB8_SRGB:
+        case Format::ETC2_RGB8_A1_UNORM:
+        case Format::ETC2_RGB8_A1_SRGB:
+        case Format::ETC2_RGB8_A8_UNORM:
+        case Format::ETC2_RGB8_A8_SRGB:
+        case Format::ETC2_R11_UNORM:
+        case Format::ETC2_R11_SNORM:
+        case Format::ETC2_R11_G11_UNORM:
+        case Format::ETC2_R11_G11_SNORM:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool IsASTCFormat(Format format) {
+    switch (format) {
+        case Format::ASTC_4X4_UNORM:
+        case Format::ASTC_4X4_SRGB:
+        case Format::ASTC_5X4_UNORM:
+        case Format::ASTC_5X4_SRGB:
+        case Format::ASTC_5X5_UNORM:
+        case Format::ASTC_5X5_SRGB:
+        case Format::ASTC_6X5_UNORM:
+        case Format::ASTC_6X5_SRGB:
+        case Format::ASTC_6X6_UNORM:
+        case Format::ASTC_6X6_SRGB:
+        case Format::ASTC_8X5_UNORM:
+        case Format::ASTC_8X5_SRGB:
+        case Format::ASTC_8X6_UNORM:
+        case Format::ASTC_8X6_SRGB:
+        case Format::ASTC_8X8_UNORM:
+        case Format::ASTC_8X8_SRGB:
+        case Format::ASTC_10X5_UNORM:
+        case Format::ASTC_10X5_SRGB:
+        case Format::ASTC_10X6_UNORM:
+        case Format::ASTC_10X6_SRGB:
+        case Format::ASTC_10X8_UNORM:
+        case Format::ASTC_10X8_SRGB:
+        case Format::ASTC_10X10_UNORM:
+        case Format::ASTC_10X10_SRGB:
+        case Format::ASTC_12X10_UNORM:
+        case Format::ASTC_12X10_SRGB:
+        case Format::ASTC_12X12_UNORM:
+        case Format::ASTC_12X12_SRGB:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool Is16BitNormFormat(Format format) {
+    switch (format) {
+        case Format::R16_UNORM:
+        case Format::R16_SNORM:
+        case Format::RG16_UNORM:
+        case Format::RG16_SNORM:
+        case Format::RGBA16_UNORM:
+        case Format::RGBA16_SNORM:
+            return true;
+        default:
+            return false;
+    }
+}
+
 DeviceWGPU::DeviceWGPU(const CallbackInterface& callbacks, const AllocationCallbacks& allocationCallbacks)
     : DeviceBase(callbacks, allocationCallbacks)
     , m_QueueFamilies{
           Vector<QueueWGPU*>(GetStdAllocator()),
           Vector<QueueWGPU*>(GetStdAllocator()),
           Vector<QueueWGPU*>(GetStdAllocator()),
-      } {
+          Vector<QueueWGPU*>(GetStdAllocator()),
+          Vector<QueueWGPU*>(GetStdAllocator()),
+      }
+    , m_HostCopyContexts(GetStdAllocator()) {
     m_Desc.graphicsAPI = GraphicsAPI::WGPU;
     m_Desc.nriVersion = NRI_VERSION;
 }
 
 DeviceWGPU::~DeviceWGPU() {
     WaitIdle();
+
+    for (HostCopyContextWGPU* context : m_HostCopyContexts) {
+        Destroy(GetAllocationCallbacks(), context->readbackBuffer);
+        Destroy(GetAllocationCallbacks(), context);
+    }
 
     for (auto& queueFamily : m_QueueFamilies) {
         for (QueueWGPU* queue : queueFamily)
@@ -112,22 +217,32 @@ Result DeviceWGPU::CreateInstanceAndDevice(const DeviceCreationDesc& desc) {
     if (!m_Instance)
         return Result::FAILURE;
 
-    WGPURequestAdapterOptions adapterOptions = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
-    adapterOptions.powerPreference = WGPUPowerPreference_HighPerformance;
+    WGPUInstanceEnumerateAdapterOptions adapterOptions = {};
+    adapterOptions.backends = WGPUInstanceBackend_Primary;
 
-    RequestAdapterContext adapterContext = {};
-    WGPURequestAdapterCallbackInfo adapterCallbackInfo = WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
-    adapterCallbackInfo.mode = WGPUCallbackMode_AllowProcessEvents;
-    adapterCallbackInfo.callback = OnAdapterRequested;
-    adapterCallbackInfo.userdata1 = &adapterContext;
+    size_t adapterNum = wgpuInstanceEnumerateAdapters(m_Instance, &adapterOptions, nullptr);
+    Scratch<WGPUAdapter> adapters = NRI_ALLOCATE_SCRATCH(*this, WGPUAdapter, adapterNum);
+    adapterNum = wgpuInstanceEnumerateAdapters(m_Instance, &adapterOptions, adapters);
 
-    wgpuInstanceRequestAdapter(m_Instance, &adapterOptions, adapterCallbackInfo);
-    WaitForAsyncRequest(m_Instance, adapterContext.done);
+    for (size_t i = 0; i < adapterNum; i++) {
+        WGPUAdapterInfo adapterInfo = WGPU_ADAPTER_INFO_INIT;
+        bool isSameAdapter = wgpuAdapterGetInfo(adapters[i], &adapterInfo) == WGPUStatus_Success && IsSameAdapter(*desc.adapterDesc, adapterInfo);
+        wgpuAdapterInfoFreeMembers(adapterInfo);
 
-    if (adapterContext.status != WGPURequestAdapterStatus_Success || !adapterContext.adapter)
+        if (isSameAdapter && IsAdapterSupported(adapters[i])) {
+            m_Adapter = adapters[i];
+            adapters[i] = nullptr;
+            break;
+        }
+    }
+
+    for (size_t i = 0; i < adapterNum; i++) {
+        if (adapters[i])
+            wgpuAdapterRelease(adapters[i]);
+    }
+
+    if (!m_Adapter)
         return Result::FAILURE;
-
-    m_Adapter = adapterContext.adapter;
 
     std::array<WGPUFeatureName, 48> requiredFeatures = {};
     size_t requiredFeatureNum = 0;
@@ -180,8 +295,8 @@ Result DeviceWGPU::CreateInstanceAndDevice(const DeviceCreationDesc& desc) {
         requiredFeatures[requiredFeatureNum++] = (WGPUFeatureName)WGPUNativeFeature_StorageResourceBindingArray;
     if (wgpuAdapterHasFeature(m_Adapter, (WGPUFeatureName)WGPUNativeFeature_BufferBindingArray))
         requiredFeatures[requiredFeatureNum++] = (WGPUFeatureName)WGPUNativeFeature_BufferBindingArray;
-    if (wgpuAdapterHasFeature(m_Adapter, (WGPUFeatureName)WGPUNativeFeature_UniformBufferAndStorageTextureArrayNonUniformIndexing))
-        requiredFeatures[requiredFeatureNum++] = (WGPUFeatureName)WGPUNativeFeature_UniformBufferAndStorageTextureArrayNonUniformIndexing;
+    if (wgpuAdapterHasFeature(m_Adapter, (WGPUFeatureName)WGPUNativeFeature_StorageTextureArrayNonUniformIndexing))
+        requiredFeatures[requiredFeatureNum++] = (WGPUFeatureName)WGPUNativeFeature_StorageTextureArrayNonUniformIndexing;
 
     bool isTimestampQuerySupported = wgpuAdapterHasFeature(m_Adapter, WGPUFeatureName_TimestampQuery) == WGPU_TRUE;
     bool isTimestampQueryInsideEncodersSupported = wgpuAdapterHasFeature(m_Adapter, (WGPUFeatureName)WGPUNativeFeature_TimestampQueryInsideEncoders) == WGPU_TRUE;
@@ -192,12 +307,18 @@ Result DeviceWGPU::CreateInstanceAndDevice(const DeviceCreationDesc& desc) {
         requiredFeatures[requiredFeatureNum++] = (WGPUFeatureName)WGPUNativeFeature_TimestampQueryInsidePasses;
     }
 
-    WGPUNativeLimits nativeLimits = {};
-    nativeLimits.chain.sType = (WGPUSType)WGPUSType_NativeLimits;
-    nativeLimits.maxImmediateSize = 256;
+    WGPUNativeLimits adapterNativeLimits = WGPU_NATIVE_LIMITS_INIT;
+    WGPULimits adapterLimits = WGPU_LIMITS_INIT;
+    adapterLimits.nextInChain = &adapterNativeLimits.chain;
+    if (wgpuAdapterGetLimits(m_Adapter, &adapterLimits) != WGPUStatus_Success)
+        return Result::FAILURE;
+
+    WGPUNativeLimits requiredNativeLimits = WGPU_NATIVE_LIMITS_INIT;
+    requiredNativeLimits.maxBindingArrayElementsPerShaderStage = adapterNativeLimits.maxBindingArrayElementsPerShaderStage;
+    requiredNativeLimits.maxBindingArraySamplerElementsPerShaderStage = adapterNativeLimits.maxBindingArraySamplerElementsPerShaderStage;
 
     WGPULimits requiredLimits = WGPU_LIMITS_INIT;
-    requiredLimits.nextInChain = &nativeLimits.chain;
+    requiredLimits.nextInChain = &requiredNativeLimits.chain;
     requiredLimits.maxImmediateSize = 256;
 
     WGPUDeviceExtras deviceExtras = {};
@@ -354,6 +475,8 @@ void DeviceWGPU::FillDesc(const AdapterDesc& adapterDesc) {
     m_Desc.features.shaderBytecodeSPIRV = true;
     m_Desc.features.shaderBytecodeWGSL = true;
     m_Desc.features.timestamp = m_IsTimestampQueryInsidePassesSupported;
+    m_Desc.features.rectColorClears = true;
+    m_Desc.features.rectDepthStencilClears = true;
     m_Desc.features.getMemoryDesc2 = true;
     m_Desc.features.componentSwizzle = wgpuDeviceHasFeature(m_Device, WGPUFeatureName_TextureComponentSwizzle) == WGPU_TRUE;
     m_Desc.features.rootConstantsOffset = true;
@@ -363,96 +486,6 @@ void DeviceWGPU::FillDesc(const AdapterDesc& adapterDesc) {
 
 void DeviceWGPU::Destruct() {
     Destroy(GetAllocationCallbacks(), this);
-}
-
-static bool IsBCFormat(Format format) {
-    switch (format) {
-        case Format::BC1_RGBA_UNORM:
-        case Format::BC1_RGBA_SRGB:
-        case Format::BC2_RGBA_UNORM:
-        case Format::BC2_RGBA_SRGB:
-        case Format::BC3_RGBA_UNORM:
-        case Format::BC3_RGBA_SRGB:
-        case Format::BC4_R_UNORM:
-        case Format::BC4_R_SNORM:
-        case Format::BC5_RG_UNORM:
-        case Format::BC5_RG_SNORM:
-        case Format::BC6H_RGB_UFLOAT:
-        case Format::BC6H_RGB_SFLOAT:
-        case Format::BC7_RGBA_UNORM:
-        case Format::BC7_RGBA_SRGB:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool IsETC2Format(Format format) {
-    switch (format) {
-        case Format::ETC2_RGB8_UNORM:
-        case Format::ETC2_RGB8_SRGB:
-        case Format::ETC2_RGB8_A1_UNORM:
-        case Format::ETC2_RGB8_A1_SRGB:
-        case Format::ETC2_RGB8_A8_UNORM:
-        case Format::ETC2_RGB8_A8_SRGB:
-        case Format::ETC2_R11_UNORM:
-        case Format::ETC2_R11_SNORM:
-        case Format::ETC2_R11_G11_UNORM:
-        case Format::ETC2_R11_G11_SNORM:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool IsASTCFormat(Format format) {
-    switch (format) {
-        case Format::ASTC_4X4_UNORM:
-        case Format::ASTC_4X4_SRGB:
-        case Format::ASTC_5X4_UNORM:
-        case Format::ASTC_5X4_SRGB:
-        case Format::ASTC_5X5_UNORM:
-        case Format::ASTC_5X5_SRGB:
-        case Format::ASTC_6X5_UNORM:
-        case Format::ASTC_6X5_SRGB:
-        case Format::ASTC_6X6_UNORM:
-        case Format::ASTC_6X6_SRGB:
-        case Format::ASTC_8X5_UNORM:
-        case Format::ASTC_8X5_SRGB:
-        case Format::ASTC_8X6_UNORM:
-        case Format::ASTC_8X6_SRGB:
-        case Format::ASTC_8X8_UNORM:
-        case Format::ASTC_8X8_SRGB:
-        case Format::ASTC_10X5_UNORM:
-        case Format::ASTC_10X5_SRGB:
-        case Format::ASTC_10X6_UNORM:
-        case Format::ASTC_10X6_SRGB:
-        case Format::ASTC_10X8_UNORM:
-        case Format::ASTC_10X8_SRGB:
-        case Format::ASTC_10X10_UNORM:
-        case Format::ASTC_10X10_SRGB:
-        case Format::ASTC_12X10_UNORM:
-        case Format::ASTC_12X10_SRGB:
-        case Format::ASTC_12X12_UNORM:
-        case Format::ASTC_12X12_SRGB:
-            return true;
-        default:
-            return false;
-    }
-}
-
-static bool Is16BitNormFormat(Format format) {
-    switch (format) {
-        case Format::R16_UNORM:
-        case Format::R16_SNORM:
-        case Format::RG16_UNORM:
-        case Format::RG16_SNORM:
-        case Format::RGBA16_UNORM:
-        case Format::RGBA16_SNORM:
-            return true;
-        default:
-            return false;
-    }
 }
 
 FormatSupportBits DeviceWGPU::GetFormatSupport(Format format) const {
@@ -496,8 +529,221 @@ Result DeviceWGPU::GetQueue(QueueType queueType, uint32_t queueIndex, Queue*& qu
 }
 
 Result DeviceWGPU::WaitIdle() {
+    ExclusiveScope lock(m_QueueLock);
+
     if (m_Device)
         wgpuDevicePoll(m_Device, WGPU_TRUE, nullptr);
+
+    return Result::SUCCESS;
+}
+
+void DeviceWGPU::WriteBuffer(WGPUBuffer buffer, uint64_t offset, const void* data, size_t size) {
+    ExclusiveScope lock(m_QueueLock);
+
+    wgpuQueueWriteBuffer(m_Queue, buffer, offset, data, size);
+}
+
+HostCopyLayoutWGPU DeviceWGPU::GetHostCopyLayout(const TextureWGPU& texture, const TextureRegionDesc& region, uint64_t& offset, bool alignForBufferCopy) const {
+    const TextureDesc& textureDesc = texture.GetDesc();
+    const FormatProps& formatProps = GetFormatProps(textureDesc.format);
+
+    HostCopyLayoutWGPU layout = {};
+    uint32_t width = region.width == WHOLE_SIZE ? GetDimension(GraphicsAPI::WGPU, textureDesc, 0, region.mipOffset) : region.width;
+    uint32_t height = region.height == WHOLE_SIZE ? GetDimension(GraphicsAPI::WGPU, textureDesc, 1, region.mipOffset) : region.height;
+    layout.width = Align(width, formatProps.blockWidth);
+    layout.height = Align(height, formatProps.blockHeight);
+    layout.depth = textureDesc.type == TextureType::TEXTURE_3D ? (region.depth == WHOLE_SIZE ? GetDimension(GraphicsAPI::WGPU, textureDesc, 2, region.mipOffset) : region.depth) : 1;
+    layout.rowNum = (layout.height + formatProps.blockHeight - 1) / formatProps.blockHeight;
+    layout.rowSize = ((layout.width + formatProps.blockWidth - 1) / formatProps.blockWidth) * formatProps.stride;
+    layout.rowPitch = alignForBufferCopy ? Align(layout.rowSize, 256u) : layout.rowSize;
+    layout.slicePitch = uint64_t(layout.rowPitch) * layout.rowNum;
+
+    uint64_t offsetAlignment = alignForBufferCopy ? std::lcm<uint64_t>(4, formatProps.stride) : 1;
+    offset = Align(offset, offsetAlignment);
+    layout.offset = offset;
+    offset += layout.slicePitch * layout.depth;
+
+    return layout;
+}
+
+Result DeviceWGPU::UploadHostMemoryToTexture(const UploadHostMemoryToTextureDesc* copyDescs, uint32_t copyDescNum) {
+    if (!copyDescNum)
+        return Result::SUCCESS;
+
+    ExclusiveScope lock(m_QueueLock);
+
+    for (uint32_t i = 0; i < copyDescNum; i++) {
+        const UploadHostMemoryToTextureDesc& copyDesc = copyDescs[i];
+        const TextureWGPU& texture = *(TextureWGPU*)copyDesc.dstTexture;
+        uint64_t ignoredOffset = 0;
+        HostCopyLayoutWGPU copyLayout = GetHostCopyLayout(texture, copyDesc.dstRegion, ignoredOffset, false);
+        uint32_t rowPitch = copyDesc.srcRowPitch ? copyDesc.srcRowPitch : copyLayout.rowSize;
+        uint32_t slicePitch = copyDesc.srcSlicePitch ? copyDesc.srcSlicePitch : rowPitch * copyLayout.rowNum;
+        size_t dataSize = (size_t)(uint64_t(copyLayout.depth - 1) * slicePitch + uint64_t(copyLayout.rowNum - 1) * rowPitch + copyLayout.rowSize);
+
+        WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        dst.texture = texture;
+        dst.mipLevel = copyDesc.dstRegion.mipOffset;
+        dst.origin.x = copyDesc.dstRegion.x;
+        dst.origin.y = copyDesc.dstRegion.y;
+        dst.origin.z = texture.GetDesc().type == TextureType::TEXTURE_3D ? copyDesc.dstRegion.z : copyDesc.dstRegion.layerOffset;
+        dst.aspect = GetTextureAspect(copyDesc.dstRegion.planes);
+
+        WGPUTexelCopyBufferInfo src = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+        src.layout.bytesPerRow = rowPitch;
+        src.layout.rowsPerImage = slicePitch / rowPitch;
+
+        WGPUExtent3D extent = {copyLayout.width, copyLayout.height, copyLayout.depth};
+        wgpuQueueWriteTexture(m_Queue, &dst, copyDesc.srcData, dataSize, &src.layout, &extent);
+    }
+
+    WGPUSubmissionIndex submissionIndex = wgpuQueueSubmitForIndex(m_Queue, 0, nullptr);
+    wgpuDevicePoll(m_Device, WGPU_TRUE, &submissionIndex);
+
+    return Result::SUCCESS;
+}
+
+Result DeviceWGPU::ReadbackTextureToHostMemory(const ReadbackTextureToHostMemoryDesc* copyDescs, uint32_t copyDescNum) {
+    if (!copyDescNum)
+        return Result::SUCCESS;
+
+    HostCopyContextWGPU* context = nullptr;
+    Result result = AcquireHostCopyContext(context);
+    if (result != Result::SUCCESS)
+        return result;
+
+    Scratch<HostCopyLayoutWGPU> layouts = NRI_ALLOCATE_SCRATCH(*this, HostCopyLayoutWGPU, copyDescNum);
+
+    uint64_t stagingSize = 0;
+    for (uint32_t i = 0; i < copyDescNum; i++)
+        layouts[i] = GetHostCopyLayout(*(TextureWGPU*)copyDescs[i].srcTexture, copyDescs[i].srcRegion, stagingSize, true);
+
+    result = EnsureReadbackBuffer(*context, stagingSize);
+
+    WGPUCommandEncoder encoder = nullptr;
+    WGPUCommandBuffer commandBuffer = nullptr;
+    if (result == Result::SUCCESS) {
+        WGPUCommandEncoderDescriptor encoderDesc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
+        encoder = wgpuDeviceCreateCommandEncoder(m_Device, &encoderDesc);
+        if (!encoder)
+            result = Result::FAILURE;
+    }
+
+    if (result == Result::SUCCESS) {
+        for (uint32_t i = 0; i < copyDescNum; i++) {
+            const ReadbackTextureToHostMemoryDesc& copyDesc = copyDescs[i];
+            const TextureWGPU& texture = *(TextureWGPU*)copyDesc.srcTexture;
+            const HostCopyLayoutWGPU& layout = layouts[i];
+
+            WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            src.texture = texture;
+            src.mipLevel = copyDesc.srcRegion.mipOffset;
+            src.origin.x = copyDesc.srcRegion.x;
+            src.origin.y = copyDesc.srcRegion.y;
+            src.origin.z = texture.GetDesc().type == TextureType::TEXTURE_3D ? copyDesc.srcRegion.z : copyDesc.srcRegion.layerOffset;
+            src.aspect = GetTextureAspect(copyDesc.srcRegion.planes);
+
+            WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+            dst.buffer = *context->readbackBuffer;
+            dst.layout.offset = layout.offset;
+            dst.layout.bytesPerRow = layout.rowPitch;
+            dst.layout.rowsPerImage = layout.rowNum;
+
+            WGPUExtent3D extent = {layout.width, layout.height, layout.depth};
+            wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
+        }
+
+        WGPUCommandBufferDescriptor commandBufferDesc = WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
+        commandBuffer = wgpuCommandEncoderFinish(encoder, &commandBufferDesc);
+        if (!commandBuffer)
+            result = Result::FAILURE;
+    }
+
+    if (result == Result::SUCCESS) {
+        ExclusiveScope lock(m_QueueLock);
+        wgpuQueueSubmitForIndex(m_Queue, 1, &commandBuffer);
+    }
+
+    if (commandBuffer)
+        wgpuCommandBufferRelease(commandBuffer);
+    if (encoder)
+        wgpuCommandEncoderRelease(encoder);
+
+    const uint8_t* stagingData = nullptr;
+    if (result == Result::SUCCESS) {
+        stagingData = (const uint8_t*)context->readbackBuffer->Map(0, stagingSize);
+        if (!stagingData)
+            result = Result::FAILURE;
+    }
+
+    for (uint32_t i = 0; result == Result::SUCCESS && i < copyDescNum; i++) {
+        const ReadbackTextureToHostMemoryDesc& copyDesc = copyDescs[i];
+        const HostCopyLayoutWGPU& layout = layouts[i];
+        uint32_t dstRowPitch = copyDesc.dstRowPitch ? copyDesc.dstRowPitch : layout.rowSize;
+        uint32_t dstSlicePitch = copyDesc.dstSlicePitch ? copyDesc.dstSlicePitch : dstRowPitch * layout.rowNum;
+        CopyTextureData(copyDesc.dstData, dstRowPitch, dstSlicePitch, stagingData + layout.offset, layout.rowPitch, layout.slicePitch, layout.rowSize, layout.rowNum, layout.depth);
+    }
+
+    if (stagingData)
+        context->readbackBuffer->Unmap();
+
+    ReleaseHostCopyContext(*context);
+
+    return result;
+}
+
+Result DeviceWGPU::AcquireHostCopyContext(HostCopyContextWGPU*& context) {
+    ExclusiveScope lock(m_HostCopyContextLock);
+
+    for (HostCopyContextWGPU* candidate : m_HostCopyContexts) {
+        if (!candidate->isInUse) {
+            candidate->isInUse = true;
+            context = candidate;
+            return Result::SUCCESS;
+        }
+    }
+
+    context = Allocate<HostCopyContextWGPU>(GetAllocationCallbacks());
+    if (!context)
+        return Result::OUT_OF_MEMORY;
+
+    context->isInUse = true;
+    m_HostCopyContexts.push_back(context);
+
+    return Result::SUCCESS;
+}
+
+void DeviceWGPU::ReleaseHostCopyContext(HostCopyContextWGPU& context) {
+    if (context.readbackBuffer && context.readbackBuffer->GetDesc().size > MAX_CACHED_HOST_COPY_RESOURCE_SIZE) {
+        Destroy(GetAllocationCallbacks(), context.readbackBuffer);
+        context.readbackBuffer = nullptr;
+    }
+
+    ExclusiveScope lock(m_HostCopyContextLock);
+    context.isInUse = false;
+}
+
+Result DeviceWGPU::EnsureReadbackBuffer(HostCopyContextWGPU& context, uint64_t size) {
+    uint64_t capacity = context.readbackBuffer ? context.readbackBuffer->GetDesc().size : 0;
+    if (size <= capacity)
+        return Result::SUCCESS;
+
+    uint64_t newSize = size;
+    if (size <= MAX_CACHED_HOST_COPY_RESOURCE_SIZE && capacity)
+        newSize = std::min(std::max(capacity * 2, size), MAX_CACHED_HOST_COPY_RESOURCE_SIZE);
+    newSize = Align(newSize, 4ull);
+
+    BufferDesc bufferDesc = {};
+    bufferDesc.size = newSize;
+
+    BufferWGPU* buffer = nullptr;
+    Result result = CreateImplementation<BufferWGPU>(buffer, bufferDesc, MemoryLocation::HOST_READBACK);
+    if (result != Result::SUCCESS)
+        return result;
+
+    Destroy(GetAllocationCallbacks(), context.readbackBuffer);
+
+    context.readbackBuffer = buffer;
 
     return Result::SUCCESS;
 }

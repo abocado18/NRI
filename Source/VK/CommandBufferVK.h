@@ -88,12 +88,15 @@ struct CommandBufferVK final : public DebugNameBase {
     void BuildMicromaps(const BuildMicromapDesc* buildMicromapDescs, uint32_t buildMicromapDescNum);
     void CopyAccelerationStructure(AccelerationStructure& dst, const AccelerationStructure& src, CopyMode copyMode);
     void CopyMicromap(Micromap& dst, const Micromap& src, CopyMode copyMode);
-    void WriteAccelerationStructuresSizes(const AccelerationStructure* const* accelerationStructures, uint32_t accelerationStructureNum, QueryPool& queryPool, uint32_t queryPoolOffset);
-    void WriteMicromapsSizes(const Micromap* const* micromaps, uint32_t micromapNum, QueryPool& queryPool, uint32_t queryPoolOffset);
+    void WriteAccelerationStructureSizes(const AccelerationStructure* const* accelerationStructures, uint32_t accelerationStructureNum, QueryPool& queryPool, uint32_t queryPoolOffset);
+    void WriteMicromapSizes(const Micromap* const* micromaps, uint32_t micromapNum, QueryPool& queryPool, uint32_t queryPoolOffset);
     void DispatchRays(const DispatchRaysDesc& dispatchRaysDesc);
     void DispatchRaysIndirect(const Buffer& buffer, uint64_t offset);
     void DrawMeshTasks(const DrawMeshTasksDesc& drawMeshTasksDesc);
     void DrawMeshTasksIndirect(const Buffer& buffer, uint64_t offset, uint32_t drawNum, uint32_t stride, const Buffer* countBuffer, uint64_t countBufferOffset);
+    void DecodeVideo(const VideoDecodeDesc& videoDecodeDesc);
+    void EncodeVideo(const VideoEncodeDesc& videoEncodeDesc);
+    void ResolveVideoEncodeFeedback(VideoSession& videoSession, Buffer& resolvedMetadata, uint64_t resolvedMetadataOffset);
 
 private:
     DeviceVK& m_Device;

@@ -100,12 +100,14 @@ struct DispatchTable {
     VK_FUNC(FreeCommandBuffers);                          // - | +
     VK_FUNC(MapMemory);                                   // - | +
     VK_FUNC(FlushMappedMemoryRanges);                     // + | +
+    VK_FUNC(InvalidateMappedMemoryRanges);                // + | +
     VK_FUNC(QueueWaitIdle);                               // - | + may return "VK_ERROR_DEVICE_LOST"
     VK_FUNC(ResetCommandPool);                            // - | +
     VK_FUNC(ResetDescriptorPool);                         // - | +
     VK_FUNC(AllocateCommandBuffers);                      // - | +
     VK_FUNC(AllocateDescriptorSets);                      // - | +
     VK_FUNC(UpdateDescriptorSets);                        // + | +
+    VK_FUNC(GetQueryPoolResults);                         // + | +
     VK_FUNC(BeginCommandBuffer);                          // - | +
     VK_FUNC(CmdSetDepthBounds);                           // - | +
     VK_FUNC(CmdSetStencilReference);                      // - | +
@@ -179,6 +181,9 @@ struct DispatchTable {
                                                           // v1.4 or VK_KHR_maintenance6
     VK_FUNC(CmdBindDescriptorSets2);                      // - | +
     VK_FUNC(CmdPushConstants2);                           // - | +
+                                                          // v1.4 or VK_EXT_host_image_copy
+    VK_FUNC(CopyMemoryToImage);                           // + | +
+    VK_FUNC(CopyImageToMemory);                           // + | +
                                                           // VK_KHR_fragment_shading_rate
     VK_FUNC(CmdSetFragmentShadingRateKHR);                // - | +
                                                           // VK_KHR_swapchain
@@ -208,6 +213,8 @@ struct DispatchTable {
     VK_FUNC(CmdTraceRaysIndirect2KHR);                    // - | +
                                                           // VK_EXT_calibrated_timestamps
     VK_FUNC(GetCalibratedTimestampsEXT);                  // + | +
+                                                          // VK_EXT_device_fault
+    VK_FUNC(GetDeviceFaultInfoEXT);                       // + | +
                                                           // VK_EXT_opacity_micromap
     VK_FUNC(CreateMicromapEXT);                           // + | +
     VK_FUNC(DestroyMicromapEXT);                          // - | +
@@ -221,6 +228,21 @@ struct DispatchTable {
     VK_FUNC(CmdDrawMeshTasksEXT);                         // - | +
     VK_FUNC(CmdDrawMeshTasksIndirectEXT);                 // - | +
     VK_FUNC(CmdDrawMeshTasksIndirectCountEXT);            // - | +
+                                                          // VK_KHR_video_decode_queue / VK_KHR_video_encode_queue
+    VK_FUNC(GetPhysicalDeviceVideoCapabilitiesKHR);       // + | +
+    VK_FUNC(GetPhysicalDeviceVideoFormatPropertiesKHR);   // + | +
+    VK_FUNC(CreateVideoSessionKHR);                       // + | +
+    VK_FUNC(DestroyVideoSessionKHR);                      // - | +
+    VK_FUNC(GetVideoSessionMemoryRequirementsKHR);        // + | +
+    VK_FUNC(BindVideoSessionMemoryKHR);                   // + | +
+    VK_FUNC(CreateVideoSessionParametersKHR);             // + | +
+    VK_FUNC(DestroyVideoSessionParametersKHR);            // - | +
+    VK_FUNC(GetEncodedVideoSessionParametersKHR);         // + | +
+    VK_FUNC(CmdBeginVideoCodingKHR);                      // - | +
+    VK_FUNC(CmdControlVideoCodingKHR);                    // - | +
+    VK_FUNC(CmdEndVideoCodingKHR);                        // - | +
+    VK_FUNC(CmdDecodeVideoKHR);                           // - | +
+    VK_FUNC(CmdEncodeVideoKHR);                           // - | +
                                                           // VK_NV_low_latency2
     VK_FUNC(GetLatencyTimingsNV);                         // + | +
     VK_FUNC(LatencySleepNV);                              // + | +

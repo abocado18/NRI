@@ -2,6 +2,10 @@
 
 #include "SharedVal.h"
 
+#if NRI_ENABLE_D3D12_SUPPORT
+#    include <d3d12.h>
+#endif
+
 #include "AccelerationStructureVal.h"
 #include "BufferVal.h"
 #include "CommandAllocatorVal.h"
@@ -20,6 +24,9 @@
 #include "QueueVal.h"
 #include "SwapChainVal.h"
 #include "TextureVal.h"
+#include "VideoPictureVal.h"
+#include "VideoSessionParametersVal.h"
+#include "VideoSessionVal.h"
 
 #include "HelperInterface.h"
 #include "ImguiInterface.h"
@@ -27,6 +34,295 @@
 #include "UpscalerInterface.h"
 
 using namespace nri;
+
+static inline bool IsVideoSessionDescValid(const VideoSessionDesc& desc) {
+    return (uint8_t)desc.type < (uint8_t)VideoSessionType::MAX_NUM && desc.codec > VideoCodec::NONE && desc.codec < VideoCodec::MAX_NUM && desc.format > Format::UNKNOWN && desc.format < Format::MAX_NUM && desc.width && desc.height && desc.maxReferenceNum != UINT32_MAX;
+}
+
+static inline bool IsVideoBufferRangeValid(uint64_t bufferSize, uint64_t offset, uint64_t requiredSize) {
+    return offset <= bufferSize && requiredSize <= bufferSize - offset;
+}
+
+static inline bool IsVideoPictureCompatibleWithSession(Format pictureFormat, uint32_t pictureWidth, uint32_t pictureHeight, const VideoSessionDesc& sessionDesc) {
+    if (pictureFormat != sessionDesc.format)
+        return false;
+
+    if (sessionDesc.type == VideoSessionType::DECODE)
+        return pictureWidth <= sessionDesc.width && pictureHeight <= sessionDesc.height;
+
+    return pictureWidth == sessionDesc.width && pictureHeight == sessionDesc.height;
+}
+
+static inline uint8_t GetVideoSessionBitDepth(Format format) {
+    return format == Format::NV12_UNORM ? 8 : 10;
+}
+
+static inline bool IsVideoSessionParametersDescValid(const VideoSessionDesc& sessionDesc, const VideoCapabilities& capabilities, const VideoSessionParametersDesc& desc) {
+    constexpr uint8_t h264HighProfileIdc = 100;
+    constexpr uint8_t h265MainProfileIdc = 1;
+    constexpr uint8_t h265Main10ProfileIdc = 2;
+    constexpr uint8_t av1MainProfile = 0;
+
+    const VideoCodec codec = sessionDesc.codec;
+    const bool hasH264 = desc.h264Parameters != nullptr;
+    const bool hasH265 = desc.h265Parameters != nullptr;
+    const bool hasAV1 = desc.av1Parameters != nullptr;
+
+    if ((uint32_t)hasH264 + (uint32_t)hasH265 + (uint32_t)hasAV1 > 1 || (hasH264 && codec != VideoCodec::H264) || (hasH265 && codec != VideoCodec::H265) || (hasAV1 && codec != VideoCodec::AV1))
+        return false;
+
+    const bool canOmitH264Parameters = sessionDesc.type == VideoSessionType::DECODE && capabilities.decodeNativeArgumentsSupported;
+    if (codec == VideoCodec::H264 && !hasH264 && !canOmitH264Parameters)
+        return false;
+
+    if (hasH264) {
+        const VideoH264SessionParametersDesc& parameters = *desc.h264Parameters;
+
+        if (!parameters.sequenceParameterSetNum || !parameters.sequenceParameterSets || !parameters.pictureParameterSetNum || !parameters.pictureParameterSets)
+            return false;
+        if ((parameters.maxSequenceParameterSetNum && parameters.maxSequenceParameterSetNum < parameters.sequenceParameterSetNum) || (parameters.maxPictureParameterSetNum && parameters.maxPictureParameterSetNum < parameters.pictureParameterSetNum))
+            return false;
+
+        uint32_t sequenceParameterSetMask = 0;
+        for (uint32_t i = 0; i < parameters.sequenceParameterSetNum; i++) {
+            const VideoH264SequenceParameterSetDesc& sequence = parameters.sequenceParameterSets[i];
+            const bool isProgressive = (sequence.flags & VideoH264SequenceParameterSetBits::FRAME_MBS_ONLY) && !(sequence.flags & VideoH264SequenceParameterSetBits::MB_ADAPTIVE_FRAME_FIELD);
+            if (sequence.sequenceParameterSetId >= 32 || (sequenceParameterSetMask & (1u << sequence.sequenceParameterSetId)) != 0 || sequence.profileIdc != h264HighProfileIdc || sequence.chromaFormatIdc != 1 || sequence.bitDepthLumaMinus8 != 0 || sequence.bitDepthChromaMinus8 != 0 || !isProgressive)
+                return false;
+
+            sequenceParameterSetMask |= 1u << sequence.sequenceParameterSetId;
+        }
+
+        std::array<uint64_t, 4> pictureParameterSetMasks = {};
+        for (uint32_t i = 0; i < parameters.pictureParameterSetNum; i++) {
+            const VideoH264PictureParameterSetDesc& picture = parameters.pictureParameterSets[i];
+            const uint64_t pictureParameterSetBit = 1ull << (picture.pictureParameterSetId % 64);
+            uint64_t& pictureParameterSetMask = pictureParameterSetMasks[picture.pictureParameterSetId / 64];
+            if (picture.sequenceParameterSetId >= 32 || (sequenceParameterSetMask & (1u << picture.sequenceParameterSetId)) == 0 || (pictureParameterSetMask & pictureParameterSetBit) != 0)
+                return false;
+
+            pictureParameterSetMask |= pictureParameterSetBit;
+        }
+    }
+
+    if (hasH265) {
+        const VideoH265SessionParametersDesc& parameters = *desc.h265Parameters;
+
+        if ((parameters.videoParameterSetNum && !parameters.videoParameterSets) || (parameters.sequenceParameterSetNum && !parameters.sequenceParameterSets) || (parameters.pictureParameterSetNum && !parameters.pictureParameterSets))
+            return false;
+        if ((parameters.maxVideoParameterSetNum && parameters.maxVideoParameterSetNum < parameters.videoParameterSetNum) || (parameters.maxSequenceParameterSetNum && parameters.maxSequenceParameterSetNum < parameters.sequenceParameterSetNum) || (parameters.maxPictureParameterSetNum && parameters.maxPictureParameterSetNum < parameters.pictureParameterSetNum))
+            return false;
+
+        const uint8_t bitDepthMinus8 = GetVideoSessionBitDepth(sessionDesc.format) - 8;
+        const uint8_t profileIdc = bitDepthMinus8 ? h265Main10ProfileIdc : h265MainProfileIdc;
+
+        uint16_t videoParameterSetMask = 0;
+        for (uint32_t i = 0; i < parameters.videoParameterSetNum; i++) {
+            const VideoH265VideoParameterSetDesc& video = parameters.videoParameterSets[i];
+            if (video.videoParameterSetId >= 16 || (videoParameterSetMask & (1u << video.videoParameterSetId)) != 0 || video.profileTierLevel.generalProfileIdc != profileIdc)
+                return false;
+
+            videoParameterSetMask |= 1u << video.videoParameterSetId;
+        }
+
+        std::array<uint8_t, 16> sequenceParameterSetToVpsPlusOne = {};
+        for (uint32_t i = 0; i < parameters.sequenceParameterSetNum; i++) {
+            const VideoH265SequenceParameterSetDesc& sequence = parameters.sequenceParameterSets[i];
+
+            if (sequence.videoParameterSetId >= 16 || sequence.sequenceParameterSetId >= 16 || !(videoParameterSetMask & (1u << sequence.videoParameterSetId)) || sequenceParameterSetToVpsPlusOne[sequence.sequenceParameterSetId] || (sequence.numShortTermRefPicSets && !sequence.shortTermRefPicSets) || (sequence.numLongTermRefPicsSps && !sequence.longTermRefPicsSps) || sequence.profileTierLevel.generalProfileIdc != profileIdc || sequence.chromaFormatIdc != 1 || sequence.bitDepthLumaMinus8 != bitDepthMinus8 || sequence.bitDepthChromaMinus8 != bitDepthMinus8)
+                return false;
+
+            sequenceParameterSetToVpsPlusOne[sequence.sequenceParameterSetId] = sequence.videoParameterSetId + 1;
+        }
+
+        uint64_t pictureParameterSetMask = 0;
+        for (uint32_t i = 0; i < parameters.pictureParameterSetNum; i++) {
+            const VideoH265PictureParameterSetDesc& picture = parameters.pictureParameterSets[i];
+            if (picture.pictureParameterSetId >= 64 || picture.sequenceParameterSetId >= 16 || picture.videoParameterSetId >= 16 || sequenceParameterSetToVpsPlusOne[picture.sequenceParameterSetId] != picture.videoParameterSetId + 1)
+                return false;
+
+            const uint64_t pictureParameterSetBit = 1ull << picture.pictureParameterSetId;
+            if (pictureParameterSetMask & pictureParameterSetBit)
+                return false;
+
+            pictureParameterSetMask |= pictureParameterSetBit;
+        }
+    }
+
+    if (hasAV1) {
+        const VideoAV1SequenceDesc& sequence = desc.av1Parameters->sequence;
+        const bool usesUnsupportedFilmGrain = sessionDesc.type == VideoSessionType::DECODE && (sequence.flags & VideoAV1SequenceBits::FILM_GRAIN_PARAMS_PRESENT);
+        if (sequence.seqProfile != av1MainProfile || sequence.bitDepth != GetVideoSessionBitDepth(sessionDesc.format) || sequence.subsamplingX != 1 || sequence.subsamplingY != 1 || usesUnsupportedFilmGrain)
+            return false;
+    }
+
+    return true;
+}
+
+static inline bool IsVideoPictureDescValid(const VideoPictureDesc& desc, const TextureDesc& textureDesc) {
+    if (!desc.texture || (uint8_t)desc.usage >= (uint8_t)VideoPictureUsage::MAX_NUM || textureDesc.type != TextureType::TEXTURE_2D)
+        return false;
+
+    const TextureUsageBits requiredUsage = desc.usage == VideoPictureUsage::DECODE_OUTPUT || desc.usage == VideoPictureUsage::DECODE_REFERENCE ? TextureUsageBits::VIDEO_DECODE : TextureUsageBits::VIDEO_ENCODE;
+    const bool requiresOperationUsage = desc.usage == VideoPictureUsage::DECODE_OUTPUT || desc.usage == VideoPictureUsage::ENCODE_INPUT;
+    const bool isReferenceOnly = (textureDesc.usage & TextureUsageBits::VIDEO_REFERENCE_ONLY) != 0;
+    const uint32_t layerNum = textureDesc.layerNum ? textureDesc.layerNum : 1;
+
+    return (textureDesc.usage & requiredUsage) != 0 && (!requiresOperationUsage || !isReferenceOnly) && desc.layer < layerNum && (!desc.width || desc.width <= textureDesc.width) && (!desc.height || desc.height <= textureDesc.height);
+}
+
+static inline bool IsVideoPictureRoleCompatible(VideoPictureUsage usage, VideoPictureRole role) {
+    if ((uint8_t)role >= (uint8_t)VideoPictureRole::MAX_NUM)
+        return false;
+
+    static constexpr std::array<VideoPictureUsage, (size_t)VideoPictureRole::MAX_NUM> usages = {
+        VideoPictureUsage::DECODE_OUTPUT,    // DECODE_OUTPUT
+        VideoPictureUsage::DECODE_REFERENCE, // DECODE_REFERENCE
+        VideoPictureUsage::DECODE_REFERENCE, // DECODE_SETUP
+        VideoPictureUsage::DECODE_OUTPUT,    // DECODE_OUTPUT_AND_SETUP
+        VideoPictureUsage::ENCODE_INPUT,     // ENCODE_INPUT
+        VideoPictureUsage::ENCODE_REFERENCE, // ENCODE_REFERENCE
+        VideoPictureUsage::ENCODE_REFERENCE, // ENCODE_RECONSTRUCTED
+    };
+    NRI_VALIDATE_ARRAY(usages);
+
+    return usage == usages[(size_t)role];
+}
+
+static inline bool HasUniqueVideoReferenceSlots(const VideoReference* references, uint32_t referenceNum) {
+    for (uint32_t i = 0; i < referenceNum; i++) {
+        for (uint32_t j = i + 1; j < referenceNum; j++) {
+            if (references[i].slot == references[j].slot)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+static inline bool IsVideoDecodeDpbLayoutValid(const VideoDecodeDesc& desc, uint32_t maxReferenceNum) {
+    if (desc.referenceNum > maxReferenceNum || (desc.referenceNum && !desc.references) || video::GetDecodeSetupSlot(desc) > maxReferenceNum || (desc.references && !HasUniqueVideoReferenceSlots(desc.references, desc.referenceNum)))
+        return false;
+
+    for (uint32_t i = 0; i < desc.referenceNum; i++) {
+        if (desc.references[i].slot > maxReferenceNum)
+            return false;
+    }
+
+    if (desc.h264PictureDesc) {
+        const VideoH264DecodePictureDesc& picture = *desc.h264PictureDesc;
+
+        if ((picture.hasReferenceSlot && picture.referenceSlot > maxReferenceNum) || picture.referenceNum > maxReferenceNum || (picture.referenceNum && !picture.references))
+            return false;
+
+        for (uint32_t i = 0; i < picture.referenceNum; i++) {
+            if (picture.references[i].slot > maxReferenceNum)
+                return false;
+        }
+    }
+
+    if (desc.h265PictureDesc) {
+        const VideoH265DecodePictureDesc& picture = *desc.h265PictureDesc;
+
+        if (picture.referenceNum > maxReferenceNum || (picture.referenceNum && !picture.references))
+            return false;
+
+        for (uint32_t i = 0; i < picture.referenceNum; i++) {
+            if (picture.references[i].slot > maxReferenceNum)
+                return false;
+        }
+    }
+
+    if (desc.av1PictureDesc) {
+        const VideoAV1DecodePictureDesc& picture = *desc.av1PictureDesc;
+
+        if (picture.referenceNum > maxReferenceNum || (picture.referenceNum && !picture.references))
+            return false;
+
+        for (uint32_t i = 0; i < picture.referenceNum; i++) {
+            if (picture.references[i].slot > maxReferenceNum)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+static inline bool IsVideoEncodeDpbLayoutValid(const VideoEncodeDesc& desc, uint32_t maxReferenceNum) {
+    if (desc.referenceNum > maxReferenceNum || (desc.referenceNum && !desc.references) || (desc.reconstructedPicture && desc.reconstructedSlot > maxReferenceNum) || (desc.references && !HasUniqueVideoReferenceSlots(desc.references, desc.referenceNum)))
+        return false;
+
+    for (uint32_t i = 0; i < desc.referenceNum; i++) {
+        if (desc.references[i].slot > maxReferenceNum)
+            return false;
+    }
+
+    if (desc.h264PictureDesc) {
+        const VideoH264EncodePictureDesc& picture = *desc.h264PictureDesc;
+
+        if (picture.referenceNum > maxReferenceNum || (picture.referenceNum && !picture.references))
+            return false;
+
+        for (uint32_t i = 0; i < picture.referenceNum; i++) {
+            if (picture.references[i].slot > maxReferenceNum)
+                return false;
+        }
+    }
+
+    if (desc.h265ReferenceDescs) {
+        for (uint32_t i = 0; i < desc.referenceNum; i++) {
+            if (desc.h265ReferenceDescs[i].slot > maxReferenceNum)
+                return false;
+        }
+    }
+
+    if (desc.av1PictureDesc) {
+        const VideoAV1EncodePictureDesc& picture = *desc.av1PictureDesc;
+
+        if (picture.referenceNum > maxReferenceNum || (picture.referenceNum && !picture.references))
+            return false;
+
+        for (uint32_t i = 0; i < picture.referenceNum; i++) {
+            if (picture.references[i].slot > maxReferenceNum)
+                return false;
+        }
+    }
+
+    return true;
+}
+
+static inline bool HasValidVideoAV1ReferenceKeys(const VideoAV1ReferenceDesc* references, uint32_t referenceNum) {
+    uint32_t referenceNameMask = 0;
+    for (uint32_t i = 0; i < referenceNum; i++) {
+        const VideoAV1ReferenceDesc& reference = references[i];
+        if (reference.refFrameIndex >= 8 || (uint8_t)reference.name >= (uint8_t)VideoAV1ReferenceName::MAX_NUM)
+            return false;
+
+        for (uint32_t j = 0; j < i; j++) {
+            const VideoAV1ReferenceDesc& previous = references[j];
+            const bool sameRefFrameIndex = reference.refFrameIndex == previous.refFrameIndex;
+            const bool sameSlot = reference.slot == previous.slot;
+
+            if (!sameRefFrameIndex && !sameSlot)
+                continue;
+
+            const bool savedOrderHintsMatch = (!reference.savedOrderHints && !previous.savedOrderHints) || (reference.savedOrderHints && previous.savedOrderHints && memcmp(reference.savedOrderHints, previous.savedOrderHints, 8) == 0);
+            if ((sameRefFrameIndex && !sameSlot) || reference.frameType != previous.frameType || reference.orderHint != previous.orderHint || reference.frameId != previous.frameId || !savedOrderHintsMatch)
+                return false;
+        }
+
+        if (reference.name == VideoAV1ReferenceName::NONE)
+            continue;
+
+        const uint32_t referenceNameBit = 1u << (uint8_t)reference.name;
+        if (referenceNameMask & referenceNameBit)
+            return false;
+
+        referenceNameMask |= referenceNameBit;
+    }
+
+    return true;
+}
 
 #include "AccelerationStructureVal.hpp"
 #include "BufferVal.hpp"
@@ -47,6 +343,9 @@ using namespace nri;
 #include "QueueVal.hpp"
 #include "SwapChainVal.hpp"
 #include "TextureVal.hpp"
+#include "VideoPictureVal.hpp"
+#include "VideoSessionParametersVal.hpp"
+#include "VideoSessionVal.hpp"
 
 DeviceBase* CreateDeviceValidation(const DeviceCreationDesc& desc, DeviceBase& device) {
     DeviceVal* deviceVal = Allocate<DeviceVal>(desc.allocationCallbacks, desc.callbackInterface, desc.allocationCallbacks, device);
@@ -538,6 +837,100 @@ static void NRI_CALL UnmapBuffer(Buffer& buffer) {
     ((BufferVal&)buffer).Unmap();
 }
 
+static bool ValidateHostTextureCopyDesc(DeviceVal& device, uint32_t i, const TextureVal& texture, const TextureRegionDesc& region, uint32_t rowPitch, uint32_t slicePitch, const char* name) {
+    const TextureDesc& textureDesc = texture.GetDesc();
+    const FormatProps& formatProps = GetFormatProps(textureDesc.format);
+
+    NRI_RETURN_ON_FAILURE(&device, &texture.GetDevice() == &device, false, "'%s[%u].texture' belongs to another device", name, i);
+    NRI_RETURN_ON_FAILURE(&device, texture.IsBoundToMemory(), false, "'%s[%u].texture' is not bound to memory", name, i);
+    NRI_RETURN_ON_FAILURE(&device, textureDesc.usage & TextureUsageBits::HOST_TRANSFER, false, "'%s[%u].texture' was not created with 'TextureUsageBits::HOST_TRANSFER'", name, i);
+    NRI_RETURN_ON_FAILURE(&device, device.GetFormatSupport(textureDesc.format) & FormatSupportBits::HOST_COPY, false, "'%s[%u].texture' format does not support 'FormatSupportBits::HOST_COPY'", name, i);
+    NRI_RETURN_ON_FAILURE(&device, textureDesc.sampleNum == 1, false, "'%s[%u].texture' is multisampled", name, i);
+    NRI_RETURN_ON_FAILURE(&device, !formatProps.isDepth && !formatProps.isStencil, false, "'%s[%u].texture' must have a color format", name, i);
+    NRI_RETURN_ON_FAILURE(&device, region.planes == PlaneBits::ALL || region.planes == PlaneBits::COLOR, false, "'%s[%u].region.planes' must be 'ALL' or 'COLOR'", name, i);
+    NRI_RETURN_ON_FAILURE(&device, region.mipOffset < textureDesc.mipNum, false, "'%s[%u].region.mipOffset' is out of bounds", name, i);
+    NRI_RETURN_ON_FAILURE(&device, region.layerOffset < textureDesc.layerNum, false, "'%s[%u].region.layerOffset' is out of bounds", name, i);
+
+    uint32_t mipWidth = std::max((uint32_t)textureDesc.width >> region.mipOffset, 1u);
+    uint32_t mipHeight = std::max((uint32_t)textureDesc.height >> region.mipOffset, 1u);
+    uint32_t mipDepth = std::max((uint32_t)textureDesc.depth >> region.mipOffset, 1u);
+    uint32_t width = region.width == WHOLE_SIZE ? mipWidth : region.width;
+    uint32_t height = region.height == WHOLE_SIZE ? mipHeight : region.height;
+    uint32_t depth = region.depth == WHOLE_SIZE ? mipDepth : region.depth;
+
+    NRI_RETURN_ON_FAILURE(&device, width && height && depth, false, "'%s[%u].region' has a zero extent", name, i);
+    NRI_RETURN_ON_FAILURE(&device, (uint32_t)region.x + width <= mipWidth, false, "'%s[%u].region' exceeds the mip width", name, i);
+    NRI_RETURN_ON_FAILURE(&device, (uint32_t)region.y + height <= mipHeight, false, "'%s[%u].region' exceeds the mip height", name, i);
+    NRI_RETURN_ON_FAILURE(&device, (uint32_t)region.z + depth <= mipDepth, false, "'%s[%u].region' exceeds the mip depth", name, i);
+
+    if (formatProps.isCompressed) {
+        NRI_RETURN_ON_FAILURE(&device, region.x % formatProps.blockWidth == 0, false, "'%s[%u].region.x' is not block aligned", name, i);
+        NRI_RETURN_ON_FAILURE(&device, region.y % formatProps.blockHeight == 0, false, "'%s[%u].region.y' is not block aligned", name, i);
+        NRI_RETURN_ON_FAILURE(&device, width % formatProps.blockWidth == 0 || (uint32_t)region.x + width == mipWidth, false, "'%s[%u].region.width' is not block aligned and does not reach the mip edge", name, i);
+        NRI_RETURN_ON_FAILURE(&device, height % formatProps.blockHeight == 0 || (uint32_t)region.y + height == mipHeight, false, "'%s[%u].region.height' is not block aligned and does not reach the mip edge", name, i);
+    }
+
+    uint32_t rowNum = (height + formatProps.blockHeight - 1) / formatProps.blockHeight;
+    uint32_t rowSize = ((width + formatProps.blockWidth - 1) / formatProps.blockWidth) * formatProps.stride;
+    uint32_t effectiveRowPitch = rowPitch ? rowPitch : rowSize;
+    uint64_t tightSlicePitch = uint64_t(effectiveRowPitch) * rowNum;
+    uint64_t effectiveSlicePitch = slicePitch ? slicePitch : tightSlicePitch;
+
+    NRI_RETURN_ON_FAILURE(&device, effectiveRowPitch >= rowSize, false, "'%s[%u].rowPitch' is too small", name, i);
+    NRI_RETURN_ON_FAILURE(&device, effectiveRowPitch % formatProps.stride == 0, false, "'%s[%u].rowPitch' is not texel-block aligned", name, i);
+    NRI_RETURN_ON_FAILURE(&device, tightSlicePitch <= uint32_t(-1), false, "'%s[%u]' requires a slice pitch greater than 4 GiB", name, i);
+    NRI_RETURN_ON_FAILURE(&device, effectiveSlicePitch >= tightSlicePitch, false, "'%s[%u].slicePitch' is too small", name, i);
+    NRI_RETURN_ON_FAILURE(&device, effectiveSlicePitch % effectiveRowPitch == 0, false, "'%s[%u].slicePitch' is not row aligned", name, i);
+
+    return true;
+}
+
+static Result NRI_CALL UploadHostMemoryToTexture(Queue& queue, const UploadHostMemoryToTextureDesc* copyDescs, uint32_t copyDescNum) {
+    QueueVal& queueVal = (QueueVal&)queue;
+    DeviceVal& deviceVal = queueVal.GetDevice();
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, !copyDescNum || copyDescs, Result::INVALID_ARGUMENT, "'copyDescs' is NULL");
+
+    Scratch<UploadHostMemoryToTextureDesc> copyDescsImpl = NRI_ALLOCATE_SCRATCH(deviceVal, UploadHostMemoryToTextureDesc, copyDescNum);
+    for (uint32_t i = 0; i < copyDescNum; i++) {
+        const UploadHostMemoryToTextureDesc& copyDesc = copyDescs[i];
+        NRI_RETURN_ON_FAILURE(&deviceVal, copyDesc.srcData, Result::INVALID_ARGUMENT, "'copyDescs[%u].srcData' is NULL", i);
+        NRI_RETURN_ON_FAILURE(&deviceVal, copyDesc.dstTexture, Result::INVALID_ARGUMENT, "'copyDescs[%u].dstTexture' is NULL", i);
+
+        const TextureVal& texture = *(TextureVal*)copyDesc.dstTexture;
+        if (!ValidateHostTextureCopyDesc(deviceVal, i, texture, copyDesc.dstRegion, copyDesc.srcRowPitch, copyDesc.srcSlicePitch, "copyDescs"))
+            return Result::INVALID_ARGUMENT;
+
+        copyDescsImpl[i] = copyDesc;
+        copyDescsImpl[i].dstTexture = texture.GetImpl();
+    }
+
+    return deviceVal.GetCoreInterfaceImpl().UploadHostMemoryToTexture(*queueVal.GetImpl(), copyDescsImpl, copyDescNum);
+}
+
+static Result NRI_CALL ReadbackTextureToHostMemory(Queue& queue, const ReadbackTextureToHostMemoryDesc* copyDescs, uint32_t copyDescNum) {
+    QueueVal& queueVal = (QueueVal&)queue;
+    DeviceVal& deviceVal = queueVal.GetDevice();
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, !copyDescNum || copyDescs, Result::INVALID_ARGUMENT, "'copyDescs' is NULL");
+
+    Scratch<ReadbackTextureToHostMemoryDesc> copyDescsImpl = NRI_ALLOCATE_SCRATCH(deviceVal, ReadbackTextureToHostMemoryDesc, copyDescNum);
+    for (uint32_t i = 0; i < copyDescNum; i++) {
+        const ReadbackTextureToHostMemoryDesc& copyDesc = copyDescs[i];
+        NRI_RETURN_ON_FAILURE(&deviceVal, copyDesc.srcTexture, Result::INVALID_ARGUMENT, "'copyDescs[%u].srcTexture' is NULL", i);
+        NRI_RETURN_ON_FAILURE(&deviceVal, copyDesc.dstData, Result::INVALID_ARGUMENT, "'copyDescs[%u].dstData' is NULL", i);
+
+        const TextureVal& texture = *(TextureVal*)copyDesc.srcTexture;
+        if (!ValidateHostTextureCopyDesc(deviceVal, i, texture, copyDesc.srcRegion, copyDesc.dstRowPitch, copyDesc.dstSlicePitch, "copyDescs"))
+            return Result::INVALID_ARGUMENT;
+
+        copyDescsImpl[i] = copyDesc;
+        copyDescsImpl[i].srcTexture = texture.GetImpl();
+    }
+
+    return deviceVal.GetCoreInterfaceImpl().ReadbackTextureToHostMemory(*queueVal.GetImpl(), copyDescsImpl, copyDescNum);
+}
+
 static uint64_t NRI_CALL GetBufferDeviceAddress(const Buffer& buffer) {
     return ((BufferVal&)buffer).GetDeviceAddress();
 }
@@ -696,6 +1089,8 @@ Result DeviceVal::FillFunctionTable(CoreInterface& table) const {
     table.ResetCommandAllocator = ::ResetCommandAllocator;
     table.MapBuffer = ::MapBuffer;
     table.UnmapBuffer = ::UnmapBuffer;
+    table.UploadHostMemoryToTexture = ::UploadHostMemoryToTexture;
+    table.ReadbackTextureToHostMemory = ::ReadbackTextureToHostMemory;
     table.GetBufferDeviceAddress = ::GetBufferDeviceAddress;
     table.SetDebugName = ::SetDebugName;
     table.GetDeviceNativeObject = ::GetDeviceNativeObject;
@@ -837,6 +1232,27 @@ Result DeviceVal::FillFunctionTable(HelperInterface& table) const {
 
 #if NRI_ENABLE_IMGUI_EXTENSION
 
+static inline bool ValidateCopyImguiDataDesc(DeviceVal& deviceVal, const CopyImguiDataDesc& copyImguiDataDesc) {
+    NRI_RETURN_ON_FAILURE(&deviceVal, !copyImguiDataDesc.drawListNum || copyImguiDataDesc.drawLists, false, "'drawLists' is NULL");
+    NRI_RETURN_ON_FAILURE(&deviceVal, !copyImguiDataDesc.textureNum || copyImguiDataDesc.textures, false, "'textures' is NULL");
+
+    for (uint32_t i = 0; i < copyImguiDataDesc.drawListNum; i++)
+        NRI_RETURN_ON_FAILURE(&deviceVal, copyImguiDataDesc.drawLists[i], false, "'drawLists[%u]' is NULL", i);
+
+    for (uint32_t i = 0; i < copyImguiDataDesc.textureNum; i++)
+        NRI_RETURN_ON_FAILURE(&deviceVal, copyImguiDataDesc.textures[i], false, "'textures[%u]' is NULL", i);
+
+    return true;
+}
+
+static inline bool ValidateDrawImguiDesc(DeviceVal& deviceVal, const DrawImguiDesc& drawImguiDesc) {
+    NRI_RETURN_ON_FAILURE(&deviceVal, drawImguiDesc.displaySize.w && drawImguiDesc.displaySize.h, false, "'displaySize' is invalid");
+    NRI_RETURN_ON_FAILURE(&deviceVal, drawImguiDesc.hdrScale >= 0.0f, false, "'hdrScale' is negative or NaN");
+    NRI_RETURN_ON_FAILURE(&deviceVal, drawImguiDesc.attachmentFormat > Format::UNKNOWN && drawImguiDesc.attachmentFormat < Format::MAX_NUM, false, "'attachmentFormat' is invalid");
+
+    return true;
+}
+
 struct ImguiVal final : public ObjectVal {
     inline ImguiVal(DeviceVal& device, ImguiImpl* impl)
         : ObjectVal(device, impl) {
@@ -873,18 +1289,48 @@ static void NRI_CALL DestroyImgui(Imgui* imgui) {
     Destroy(imguiVal);
 }
 
-static void NRI_CALL CmdCopyImguiData(CommandBuffer& commandBuffer, Streamer& streamer, Imgui& imgui, const CopyImguiDataDesc& copyImguiDataDesc) {
+static void NRI_CALL CmdCopyImguiData(CommandBuffer& commandBuffer, Streamer& streamer, Imgui& imgui, const CopyImguiDataDesc& copyImguiDataDesc, ImguiRenderData& imguiRenderData) {
+    imguiRenderData = {};
+
+    DeviceVal& deviceVal = GetDeviceVal(imgui);
     ImguiVal& imguiVal = (ImguiVal&)imgui;
     ImguiImpl* imguiImpl = imguiVal.GetImpl();
 
-    return imguiImpl->CmdCopyData(commandBuffer, streamer, copyImguiDataDesc);
+    NRI_RETURN_ON_FAILURE(&deviceVal, &GetDeviceVal(commandBuffer) == &deviceVal, ReturnVoid(), "'commandBuffer' belongs to a different device");
+    NRI_RETURN_ON_FAILURE(&deviceVal, &GetDeviceVal(streamer) == &deviceVal, ReturnVoid(), "'streamer' belongs to a different device");
+
+    if (!ValidateCopyImguiDataDesc(deviceVal, copyImguiDataDesc))
+        return;
+
+    imguiImpl->CmdCopyData(commandBuffer, streamer, copyImguiDataDesc, imguiRenderData);
+    imguiRenderData.imgui = &imgui;
 }
 
-static void NRI_CALL CmdDrawImgui(CommandBuffer& commandBuffer, Imgui& imgui, const DrawImguiDesc& drawImguiDesc) {
-    ImguiVal& imguiVal = (ImguiVal&)imgui;
+static void NRI_CALL CmdDrawImgui(CommandBuffer& commandBuffer, const ImguiRenderData& imguiRenderData, const DrawImguiDesc& drawImguiDesc) {
+    DeviceVal& deviceVal = GetDeviceVal(commandBuffer);
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, imguiRenderData.imgui, ReturnVoid(), "'imguiRenderData.imgui' is NULL");
+
+    ImguiVal& imguiVal = (ImguiVal&)*imguiRenderData.imgui;
+    NRI_RETURN_ON_FAILURE(&deviceVal, &GetDeviceVal(imguiVal) == &deviceVal, ReturnVoid(), "'imguiRenderData.imgui' belongs to a different device");
+    NRI_RETURN_ON_FAILURE(&deviceVal, !imguiRenderData.drawCmdNum || imguiRenderData.drawCommands, ReturnVoid(), "'imguiRenderData.drawCommands' is NULL");
+    NRI_RETURN_ON_FAILURE(&deviceVal, !imguiRenderData.drawCmdNum || imguiRenderData.vertices.buffer, ReturnVoid(), "'imguiRenderData.vertices.buffer' is NULL");
+
+    if (imguiRenderData.vertices.buffer) {
+        BufferVal& bufferVal = (BufferVal&)*imguiRenderData.vertices.buffer;
+        NRI_RETURN_ON_FAILURE(&deviceVal, &GetDeviceVal(bufferVal) == &deviceVal, ReturnVoid(), "'imguiRenderData.vertices.buffer' belongs to a different device");
+
+        const BufferDesc& bufferDesc = bufferVal.GetDesc();
+        NRI_RETURN_ON_FAILURE(&deviceVal, imguiRenderData.vertices.offset <= imguiRenderData.indexBufferOffset, ReturnVoid(), "'imguiRenderData.vertices.offset' is invalid");
+        NRI_RETURN_ON_FAILURE(&deviceVal, imguiRenderData.indexBufferOffset <= bufferDesc.size, ReturnVoid(), "'imguiRenderData.indexBufferOffset' is out of bounds");
+    }
+
+    if (imguiRenderData.drawCmdNum && !ValidateDrawImguiDesc(deviceVal, drawImguiDesc))
+        return;
+
     ImguiImpl* imguiImpl = imguiVal.GetImpl();
 
-    return imguiImpl->CmdDraw(commandBuffer, drawImguiDesc);
+    return imguiImpl->CmdDraw(commandBuffer, imguiRenderData, drawImguiDesc);
 }
 
 Result DeviceVal::FillFunctionTable(ImguiInterface& table) const {
@@ -907,12 +1353,12 @@ static Result NRI_CALL SetLatencySleepMode(SwapChain& swapChain, const LatencySl
     return ((SwapChainVal&)swapChain).SetLatencySleepMode(latencySleepMode);
 }
 
-static Result NRI_CALL SetLatencyMarker(SwapChain& swapChain, LatencyMarker latencyMarker) {
-    return ((SwapChainVal&)swapChain).SetLatencyMarker(latencyMarker);
+static Result NRI_CALL SetLatencyMarker(SwapChain& swapChain, uint64_t presentId, LatencyMarker latencyMarker) {
+    return ((SwapChainVal&)swapChain).SetLatencyMarker(presentId, latencyMarker);
 }
 
-static Result NRI_CALL LatencySleep(SwapChain& swapChain) {
-    return ((SwapChainVal&)swapChain).LatencySleep();
+static Result NRI_CALL LatencySleep(SwapChain& swapChain, uint64_t presentId) {
+    return ((SwapChainVal&)swapChain).LatencySleep(presentId);
 }
 
 static Result NRI_CALL GetLatencyReport(const SwapChain& swapChain, LatencyReport& latencyReport) {
@@ -1075,17 +1521,17 @@ static void NRI_CALL GetAccelerationStructureMemoryDesc2(const Device& device, c
     }
 
     Scratch<BottomLevelGeometryDesc> geometriesImplScratch = NRI_ALLOCATE_SCRATCH(deviceVal, BottomLevelGeometryDesc, geometryNum);
-    Scratch<BottomLevelMicromapDesc> micromapsImplScratch = NRI_ALLOCATE_SCRATCH(deviceVal, BottomLevelMicromapDesc, micromapNum);
+    Scratch<BottomLevelTrianglesMicromapDesc> micromapsImplScratch = NRI_ALLOCATE_SCRATCH(deviceVal, BottomLevelTrianglesMicromapDesc, micromapNum);
 
     BottomLevelGeometryDesc* geometriesImpl = geometriesImplScratch;
-    BottomLevelMicromapDesc* micromapsImpl = micromapsImplScratch;
+    BottomLevelTrianglesMicromapDesc* micromapsImpl = micromapsImplScratch;
 
     // Convert
     auto accelerationStructureDescImpl = accelerationStructureDesc;
 
     if (accelerationStructureDesc.type == AccelerationStructureType::BOTTOM_LEVEL) {
         accelerationStructureDescImpl.geometries = geometriesImplScratch;
-        ConvertBotomLevelGeometries(accelerationStructureDesc.geometries, geometryNum, geometriesImpl, micromapsImpl);
+        ConvertBottomLevelGeometries(accelerationStructureDesc.geometries, geometryNum, geometriesImpl, micromapsImpl);
     }
 
     // Call
@@ -1116,8 +1562,8 @@ static Result NRI_CALL CreatePlacedMicromap(Device& device, Memory* memory, uint
     return ((DeviceVal&)device).CreatePlacedMicromap(memory, offset, micromapDesc, micromap);
 }
 
-static Result NRI_CALL WriteShaderGroupIdentifiers(const Pipeline& pipeline, uint32_t baseShaderGroupIndex, uint32_t shaderGroupNum, void* dst) {
-    return ((PipelineVal&)pipeline).WriteShaderGroupIdentifiers(baseShaderGroupIndex, shaderGroupNum, dst);
+static Result NRI_CALL WriteShaderGroupIdentifiers(const Pipeline& pipeline, uint32_t baseShaderGroupIndex, uint32_t shaderGroupNum, uint32_t dstStride, void* dst) {
+    return ((PipelineVal&)pipeline).WriteShaderGroupIdentifiers(baseShaderGroupIndex, shaderGroupNum, dstStride, dst);
 }
 
 static void NRI_CALL CmdBuildTopLevelAccelerationStructures(CommandBuffer& commandBuffer, const BuildTopLevelAccelerationStructureDesc* buildTopLevelAccelerationStructureDescs, uint32_t buildTopLevelAccelerationStructureDescNum) {
@@ -1140,12 +1586,12 @@ static void NRI_CALL CmdDispatchRaysIndirect(CommandBuffer& commandBuffer, const
     ((CommandBufferVal&)commandBuffer).DispatchRaysIndirect(buffer, offset);
 }
 
-static void NRI_CALL CmdWriteAccelerationStructuresSizes(CommandBuffer& commandBuffer, const AccelerationStructure* const* accelerationStructures, uint32_t accelerationStructureNum, QueryPool& queryPool, uint32_t queryPoolOffset) {
-    ((CommandBufferVal&)commandBuffer).WriteAccelerationStructuresSizes(accelerationStructures, accelerationStructureNum, queryPool, queryPoolOffset);
+static void NRI_CALL CmdWriteAccelerationStructureSizes(CommandBuffer& commandBuffer, const AccelerationStructure* const* accelerationStructures, uint32_t accelerationStructureNum, QueryPool& queryPool, uint32_t queryPoolOffset) {
+    ((CommandBufferVal&)commandBuffer).WriteAccelerationStructureSizes(accelerationStructures, accelerationStructureNum, queryPool, queryPoolOffset);
 }
 
-static void NRI_CALL CmdWriteMicromapsSizes(CommandBuffer& commandBuffer, const Micromap* const* micromaps, uint32_t micromapNum, QueryPool& queryPool, uint32_t queryPoolOffset) {
-    ((CommandBufferVal&)commandBuffer).WriteMicromapsSizes(micromaps, micromapNum, queryPool, queryPoolOffset);
+static void NRI_CALL CmdWriteMicromapSizes(CommandBuffer& commandBuffer, const Micromap* const* micromaps, uint32_t micromapNum, QueryPool& queryPool, uint32_t queryPoolOffset) {
+    ((CommandBufferVal&)commandBuffer).WriteMicromapSizes(micromaps, micromapNum, queryPool, queryPoolOffset);
 }
 
 static void NRI_CALL CmdCopyAccelerationStructure(CommandBuffer& commandBuffer, AccelerationStructure& dst, const AccelerationStructure& src, CopyMode copyMode) {
@@ -1202,12 +1648,239 @@ Result DeviceVal::FillFunctionTable(RayTracingInterface& table) const {
     table.CmdBuildMicromaps = ::CmdBuildMicromaps;
     table.CmdDispatchRays = ::CmdDispatchRays;
     table.CmdDispatchRaysIndirect = ::CmdDispatchRaysIndirect;
-    table.CmdWriteAccelerationStructuresSizes = ::CmdWriteAccelerationStructuresSizes;
-    table.CmdWriteMicromapsSizes = ::CmdWriteMicromapsSizes;
+    table.CmdWriteAccelerationStructureSizes = ::CmdWriteAccelerationStructureSizes;
+    table.CmdWriteMicromapSizes = ::CmdWriteMicromapSizes;
     table.CmdCopyAccelerationStructure = ::CmdCopyAccelerationStructure;
     table.CmdCopyMicromap = ::CmdCopyMicromap;
     table.GetAccelerationStructureNativeObject = ::GetAccelerationStructureNativeObject;
     table.GetMicromapNativeObject = ::GetMicromapNativeObject;
+
+    return Result::SUCCESS;
+}
+
+#pragma endregion
+
+//============================================================================================================================================================================================
+#pragma region[  Video  ]
+
+static Result NRI_CALL GetVideoCapabilities(const Device& device, const VideoSessionDesc& videoSessionDesc, VideoCapabilities& videoCapabilities) {
+    const DeviceVal& deviceVal = (const DeviceVal&)device;
+    NRI_RETURN_ON_FAILURE(&deviceVal, IsVideoSessionDescValid(videoSessionDesc), Result::INVALID_ARGUMENT, "'videoSessionDesc' is invalid");
+
+    return deviceVal.GetVideoInterfaceImpl().GetVideoCapabilities(deviceVal.GetImpl(), videoSessionDesc, videoCapabilities);
+}
+
+static Result NRI_CALL GetVideoAV1Capabilities(const Device& device, const VideoSessionDesc& videoSessionDesc, VideoAV1Capabilities& videoAV1Capabilities) {
+    const DeviceVal& deviceVal = (const DeviceVal&)device;
+    NRI_RETURN_ON_FAILURE(&deviceVal, IsVideoSessionDescValid(videoSessionDesc) && videoSessionDesc.codec == VideoCodec::AV1, Result::INVALID_ARGUMENT, "'videoSessionDesc' must describe a valid AV1 session");
+
+    return deviceVal.GetVideoInterfaceImpl().GetVideoAV1Capabilities(deviceVal.GetImpl(), videoSessionDesc, videoAV1Capabilities);
+}
+
+static Result NRI_CALL CreateVideoSession(Device& device, const VideoSessionDesc& videoSessionDesc, VideoSession*& videoSession) {
+    DeviceVal& deviceVal = (DeviceVal&)device;
+    videoSession = nullptr;
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, IsVideoSessionDescValid(videoSessionDesc), Result::INVALID_ARGUMENT, "'videoSessionDesc' is invalid");
+
+    VideoCapabilities videoCapabilities = {};
+    Result result = deviceVal.GetVideoInterfaceImpl().GetVideoCapabilities(deviceVal.GetImpl(), videoSessionDesc, videoCapabilities);
+
+    if (result != Result::SUCCESS)
+        return result;
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, videoSessionDesc.maxReferenceNum <= videoCapabilities.maxReferenceNum, Result::UNSUPPORTED, "'maxReferenceNum' exceeds the backend capability");
+
+    VideoSession* videoSessionImpl = nullptr;
+    result = deviceVal.GetVideoInterfaceImpl().CreateVideoSession(deviceVal.GetImpl(), videoSessionDesc, videoSessionImpl);
+
+    if (result != Result::SUCCESS)
+        return result;
+
+    videoSession = (VideoSession*)Allocate<VideoSessionVal>(deviceVal.GetAllocationCallbacks(), deviceVal, videoSessionImpl, videoSessionDesc, videoCapabilities);
+
+    if (!videoSession) {
+        deviceVal.GetVideoInterfaceImpl().DestroyVideoSession(videoSessionImpl);
+
+        return Result::OUT_OF_MEMORY;
+    }
+
+    return Result::SUCCESS;
+}
+
+static void NRI_CALL DestroyVideoSession(VideoSession* videoSession) {
+    if (!videoSession)
+        return;
+
+    VideoSessionVal& videoSessionVal = *(VideoSessionVal*)videoSession;
+    videoSessionVal.GetVideoInterfaceImpl().DestroyVideoSession(videoSessionVal.GetImpl());
+    Destroy(&videoSessionVal);
+}
+
+static void NRI_CALL ResetVideoSession(VideoSession& videoSession) {
+    VideoSessionVal& videoSessionVal = (VideoSessionVal&)videoSession;
+    videoSessionVal.GetVideoInterfaceImpl().ResetVideoSession(*videoSessionVal.GetImpl());
+}
+
+static Result NRI_CALL CreateVideoSessionParameters(Device& device, const VideoSessionParametersDesc& videoSessionParametersDesc, VideoSessionParameters*& videoSessionParameters) {
+    DeviceVal& deviceVal = (DeviceVal&)device;
+    videoSessionParameters = nullptr;
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, videoSessionParametersDesc.session, Result::INVALID_ARGUMENT, "'session' is NULL");
+
+    VideoSessionVal& sessionVal = *(VideoSessionVal*)videoSessionParametersDesc.session;
+    NRI_RETURN_ON_FAILURE(&deviceVal, &sessionVal.GetDevice() == &deviceVal, Result::INVALID_ARGUMENT, "'session' belongs to another device");
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, IsVideoSessionParametersDescValid(sessionVal.GetDesc(), sessionVal.GetCapabilities(), videoSessionParametersDesc), Result::INVALID_ARGUMENT, "'videoSessionParametersDesc' is invalid for the fixed session profile, format or picture layout");
+
+    VideoSessionParametersDesc descImpl = videoSessionParametersDesc;
+    descImpl.session = sessionVal.GetImpl();
+
+    VideoSessionParameters* impl = nullptr;
+    Result result = deviceVal.GetVideoInterfaceImpl().CreateVideoSessionParameters(deviceVal.GetImpl(), descImpl, impl);
+    if (result != Result::SUCCESS)
+        return result;
+
+    videoSessionParameters = (VideoSessionParameters*)Allocate<VideoSessionParametersVal>(deviceVal.GetAllocationCallbacks(), deviceVal, impl, sessionVal, videoSessionParametersDesc);
+    if (!videoSessionParameters) {
+        deviceVal.GetVideoInterfaceImpl().DestroyVideoSessionParameters(impl);
+
+        return Result::OUT_OF_MEMORY;
+    }
+
+    return Result::SUCCESS;
+}
+
+static void NRI_CALL DestroyVideoSessionParameters(VideoSessionParameters* videoSessionParameters) {
+    if (!videoSessionParameters)
+        return;
+
+    VideoSessionParametersVal& videoSessionParametersVal = *(VideoSessionParametersVal*)videoSessionParameters;
+    videoSessionParametersVal.GetVideoInterfaceImpl().DestroyVideoSessionParameters(videoSessionParametersVal.GetImpl());
+    Destroy(&videoSessionParametersVal);
+}
+
+static Result NRI_CALL CreateVideoPicture(Device& device, const VideoPictureDesc& videoPictureDesc, VideoPicture*& videoPicture) {
+    DeviceVal& deviceVal = (DeviceVal&)device;
+    videoPicture = nullptr;
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, videoPictureDesc.texture, Result::INVALID_ARGUMENT, "'texture' is NULL");
+
+    TextureVal& textureVal = *(TextureVal*)videoPictureDesc.texture;
+    NRI_RETURN_ON_FAILURE(&deviceVal, &textureVal.GetDevice() == &deviceVal && IsVideoPictureDescValid(videoPictureDesc, textureVal.GetDesc()), Result::INVALID_ARGUMENT, "'videoPictureDesc' is invalid or uses a texture from another device");
+
+    VideoPictureDesc descImpl = videoPictureDesc;
+    descImpl.texture = textureVal.GetImpl();
+
+    VideoPicture* impl = nullptr;
+    Result result = deviceVal.GetVideoInterfaceImpl().CreateVideoPicture(deviceVal.GetImpl(), descImpl, impl);
+    if (result != Result::SUCCESS)
+        return result;
+
+    videoPicture = (VideoPicture*)Allocate<VideoPictureVal>(deviceVal.GetAllocationCallbacks(), deviceVal, impl, videoPictureDesc, textureVal.GetDesc());
+    if (!videoPicture) {
+        deviceVal.GetVideoInterfaceImpl().DestroyVideoPicture(impl);
+
+        return Result::OUT_OF_MEMORY;
+    }
+
+    return Result::SUCCESS;
+}
+
+static void NRI_CALL DestroyVideoPicture(VideoPicture* videoPicture) {
+    if (!videoPicture)
+        return;
+
+    VideoPictureVal& videoPictureVal = *(VideoPictureVal*)videoPicture;
+    videoPictureVal.GetVideoInterfaceImpl().DestroyVideoPicture(videoPictureVal.GetImpl());
+    Destroy(&videoPictureVal);
+}
+
+static Result NRI_CALL GetVideoPictureState(const VideoPicture& videoPicture, VideoPictureRole role, VideoPictureState& state) {
+    const VideoPictureVal& videoPictureVal = (const VideoPictureVal&)videoPicture;
+    NRI_RETURN_ON_FAILURE(&videoPictureVal.GetDevice(), IsVideoPictureRoleCompatible(videoPictureVal.GetUsage(), role), Result::INVALID_ARGUMENT, "'role' is incompatible with 'videoPicture' usage");
+
+    return videoPictureVal.GetDevice().GetVideoInterfaceImpl().GetVideoPictureState(*videoPictureVal.GetImpl(), role, state);
+}
+
+static Result NRI_CALL WriteVideoAnnexBParameterSets(VideoAnnexBParameterSetsDesc& annexBParameterSetsDesc) {
+    if (annexBParameterSetsDesc.codec == VideoCodec::H264) {
+        if (!annexBParameterSetsDesc.h264Sps || !annexBParameterSetsDesc.h264Pps)
+            return Result::INVALID_ARGUMENT;
+    } else if (annexBParameterSetsDesc.codec == VideoCodec::H265) {
+        if (!annexBParameterSetsDesc.h265Vps || !annexBParameterSetsDesc.h265Sps || !annexBParameterSetsDesc.h265Pps)
+            return Result::INVALID_ARGUMENT;
+    } else
+        return Result::UNSUPPORTED;
+
+    return video::WriteAnnexBParameterSets(annexBParameterSetsDesc);
+}
+
+static Result NRI_CALL WriteVideoAnnexBEndOfStream(VideoAnnexBEndOfStreamDesc& annexBEndOfStreamDesc) {
+    if (annexBEndOfStreamDesc.codec != VideoCodec::H264 && annexBEndOfStreamDesc.codec != VideoCodec::H265)
+        return Result::UNSUPPORTED;
+
+    return video::WriteAnnexBEndOfStream(annexBEndOfStreamDesc);
+}
+
+static Result NRI_CALL WriteVideoAV1ObuHeaders(VideoAV1ObuHeadersDesc& av1ObuHeadersDesc) {
+    return video::WriteAV1ObuHeaders(av1ObuHeadersDesc);
+}
+
+static void NRI_CALL CmdDecodeVideo(CommandBuffer& commandBuffer, const VideoDecodeDesc& videoDecodeDesc) {
+    ((CommandBufferVal&)commandBuffer).DecodeVideo(videoDecodeDesc);
+}
+
+static void NRI_CALL CmdEncodeVideo(CommandBuffer& commandBuffer, const VideoEncodeDesc& videoEncodeDesc) {
+    ((CommandBufferVal&)commandBuffer).EncodeVideo(videoEncodeDesc);
+}
+
+static void NRI_CALL CmdResolveVideoEncodeFeedback(CommandBuffer& commandBuffer, VideoSession& videoSession, Buffer& resolvedMetadata, uint64_t resolvedMetadataOffset) {
+    ((CommandBufferVal&)commandBuffer).ResolveVideoEncodeFeedback(videoSession, resolvedMetadata, resolvedMetadataOffset);
+}
+
+static Result NRI_CALL GetVideoEncodeFeedback(VideoSession& videoSession, Buffer& resolvedMetadataReadback, uint64_t resolvedMetadataOffset, VideoEncodeFeedback& feedback) {
+    VideoSessionVal& videoSessionVal = (VideoSessionVal&)videoSession;
+    BufferVal& resolvedMetadataReadbackVal = (BufferVal&)resolvedMetadataReadback;
+    NRI_RETURN_ON_FAILURE(&videoSessionVal.GetDevice(), videoSessionVal.GetDesc().type == VideoSessionType::ENCODE && videoSessionVal.GetCapabilities().encodeFeedbackSupported && &videoSessionVal.GetDevice() == &resolvedMetadataReadbackVal.GetDevice() && videoSessionVal.IsResolvedMetadataRangeValid(resolvedMetadataReadbackVal, resolvedMetadataOffset), Result::INVALID_ARGUMENT, "encode feedback must be supported and 'resolvedMetadataReadback' must be a valid range from the encode session device");
+
+    return videoSessionVal.GetDevice().GetVideoInterfaceImpl().GetVideoEncodeFeedback(*videoSessionVal.GetImpl(), *resolvedMetadataReadbackVal.GetImpl(), resolvedMetadataOffset, feedback);
+}
+
+static Result NRI_CALL GetVideoAV1EncodeDecodeInfo(VideoSession& videoSession, Buffer& resolvedMetadataReadback, uint64_t resolvedMetadataOffset,
+    const VideoAV1EncodeDecodeInfoDesc& desc, VideoAV1EncodeDecodeInfo& info) {
+    VideoSessionVal& videoSessionVal = (VideoSessionVal&)videoSession;
+    BufferVal& resolvedMetadataReadbackVal = (BufferVal&)resolvedMetadataReadback;
+    NRI_RETURN_ON_FAILURE(&videoSessionVal.GetDevice(), desc.feedback && desc.sequence, Result::INVALID_ARGUMENT, "'feedback' and 'sequence' must be valid");
+    NRI_RETURN_ON_FAILURE(&videoSessionVal.GetDevice(), (desc.references == nullptr) == (desc.referenceNum == 0) && desc.referenceNum <= 8, Result::INVALID_ARGUMENT, "'references' and 'referenceNum' are inconsistent");
+    NRI_RETURN_ON_FAILURE(&videoSessionVal.GetDevice(), !desc.references || HasValidVideoAV1ReferenceKeys(desc.references, desc.referenceNum), Result::INVALID_ARGUMENT, "'references' contain inconsistent AV1 identities");
+    NRI_RETURN_ON_FAILURE(&videoSessionVal.GetDevice(), videoSessionVal.GetDesc().type == VideoSessionType::ENCODE && videoSessionVal.GetDesc().codec == VideoCodec::AV1 && videoSessionVal.GetCapabilities().encodeFeedbackSupported && &videoSessionVal.GetDevice() == &resolvedMetadataReadbackVal.GetDevice() && videoSessionVal.IsResolvedMetadataRangeValid(resolvedMetadataReadbackVal, resolvedMetadataOffset), Result::INVALID_ARGUMENT, "encode feedback must be supported and 'resolvedMetadataReadback' must be a valid range from the AV1 encode session device");
+
+    return videoSessionVal.GetDevice().GetVideoInterfaceImpl().GetVideoAV1EncodeDecodeInfo(*videoSessionVal.GetImpl(), *resolvedMetadataReadbackVal.GetImpl(), resolvedMetadataOffset, desc, info);
+}
+
+Result DeviceVal::FillFunctionTable(VideoInterface& table) const {
+    if (!m_IsExtSupported.video)
+        return Result::UNSUPPORTED;
+
+    table.GetVideoCapabilities = ::GetVideoCapabilities;
+    table.GetVideoAV1Capabilities = ::GetVideoAV1Capabilities;
+    table.CreateVideoSession = ::CreateVideoSession;
+    table.DestroyVideoSession = ::DestroyVideoSession;
+    table.ResetVideoSession = ::ResetVideoSession;
+    table.CreateVideoSessionParameters = ::CreateVideoSessionParameters;
+    table.DestroyVideoSessionParameters = ::DestroyVideoSessionParameters;
+    table.CreateVideoPicture = ::CreateVideoPicture;
+    table.DestroyVideoPicture = ::DestroyVideoPicture;
+    table.GetVideoPictureState = ::GetVideoPictureState;
+    table.WriteVideoAnnexBParameterSets = ::WriteVideoAnnexBParameterSets;
+    table.WriteVideoAnnexBEndOfStream = ::WriteVideoAnnexBEndOfStream;
+    table.WriteVideoAV1ObuHeaders = ::WriteVideoAV1ObuHeaders;
+    table.CmdDecodeVideo = ::CmdDecodeVideo;
+    table.CmdEncodeVideo = ::CmdEncodeVideo;
+    table.CmdResolveVideoEncodeFeedback = ::CmdResolveVideoEncodeFeedback;
+    table.GetVideoEncodeFeedback = ::GetVideoEncodeFeedback;
+    table.GetVideoAV1EncodeDecodeInfo = ::GetVideoAV1EncodeDecodeInfo;
 
     return Result::SUCCESS;
 }
@@ -1220,7 +1893,8 @@ Result DeviceVal::FillFunctionTable(RayTracingInterface& table) const {
 struct StreamerVal final : public ObjectVal {
     inline StreamerVal(DeviceVal& device, StreamerImpl* impl, const StreamerDesc& desc)
         : ObjectVal(device, impl)
-        , m_Desc(desc) {
+        , m_Desc(desc)
+        , m_CopyBatches(device.GetStdAllocator()) {
     }
 
     inline StreamerImpl* GetImpl() const {
@@ -1228,13 +1902,25 @@ struct StreamerVal final : public ObjectVal {
     }
 
     StreamerDesc m_Desc = {}; // only for .natvis
+    Vector<StreamerCopyBatch> m_CopyBatches;
+    Lock m_Lock;
 };
+
+static inline size_t FindStreamerCopyBatch(const Vector<StreamerCopyBatch>& copyBatches, StreamerCopyBatch copyBatch) {
+    for (size_t i = 0; i < copyBatches.size(); i++) {
+        if (copyBatches[i] == copyBatch)
+            return i;
+    }
+
+    return SIZE_MAX;
+}
 
 static Result NRI_CALL CreateStreamer(Device& device, const StreamerDesc& streamerDesc, Streamer*& streamer) {
     DeviceVal& deviceVal = (DeviceVal&)device;
 
     NRI_RETURN_ON_FAILURE(&deviceVal, streamerDesc.constantBufferMemoryLocation < MemoryLocation::MAX_NUM, Result::INVALID_ARGUMENT, "'constantBufferMemoryLocation' is invalid");
     NRI_RETURN_ON_FAILURE(&deviceVal, streamerDesc.dynamicBufferMemoryLocation < MemoryLocation::MAX_NUM, Result::INVALID_ARGUMENT, "'dynamicBufferMemoryLocation' is invalid");
+    NRI_RETURN_ON_FAILURE(&deviceVal, streamerDesc.hostDataCapacity <= SIZE_MAX, Result::INVALID_ARGUMENT, "'hostDataCapacity' exceeds the HOST address space");
 
     bool isUpload = streamerDesc.constantBufferMemoryLocation == MemoryLocation::HOST_UPLOAD || streamerDesc.constantBufferMemoryLocation == MemoryLocation::DEVICE_UPLOAD;
     NRI_RETURN_ON_FAILURE(&deviceVal, isUpload, Result::INVALID_ARGUMENT, "'constantBufferMemoryLocation' must be an UPLOAD heap");
@@ -1265,6 +1951,17 @@ static void NRI_CALL DestroyStreamer(Streamer* streamer) {
     Destroy(streamerVal);
 }
 
+static StreamerCopyBatch NRI_CALL BeginStreamerCopyBatch(Streamer& streamer) {
+    StreamerVal& streamerVal = (StreamerVal&)streamer;
+    StreamerImpl* streamerImpl = streamerVal.GetImpl();
+    ExclusiveScope lock(streamerVal.m_Lock);
+
+    StreamerCopyBatch copyBatch = streamerImpl->BeginCopyBatch();
+    streamerVal.m_CopyBatches.push_back(copyBatch);
+
+    return copyBatch;
+}
+
 static Buffer* NRI_CALL GetStreamerConstantBuffer(Streamer& streamer) {
     StreamerVal& streamerVal = (StreamerVal&)streamer;
     StreamerImpl* streamerImpl = streamerVal.GetImpl();
@@ -1283,6 +1980,22 @@ static uint32_t NRI_CALL StreamConstantData(Streamer& streamer, const void* data
     return streamerImpl->StreamConstantData(data, dataSize);
 }
 
+static void* NRI_CALL StreamHostData(Streamer& streamer, const void* data, uint64_t dataSize, uint32_t placementAlignment) {
+    DeviceVal& deviceVal = GetDeviceVal(streamer);
+    StreamerVal& streamerVal = (StreamerVal&)streamer;
+    StreamerImpl* streamerImpl = streamerVal.GetImpl();
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, dataSize, nullptr, "'dataSize' is 0");
+    NRI_RETURN_ON_FAILURE(&deviceVal, data, nullptr, "'data' is NULL");
+    NRI_RETURN_ON_FAILURE(&deviceVal, !placementAlignment || !(placementAlignment & (placementAlignment - 1)), nullptr, "'placementAlignment' must be 0 or a power of 2");
+    NRI_RETURN_ON_FAILURE(&deviceVal, streamerVal.m_Desc.hostDataCapacity, nullptr, "'streamerDesc.hostDataCapacity' is 0");
+
+    void* hostData = streamerImpl->StreamHostData(data, dataSize, placementAlignment);
+    NRI_RETURN_ON_FAILURE(&deviceVal, hostData, nullptr, "'streamerDesc.hostDataCapacity' is insufficient");
+
+    return hostData;
+}
+
 static BufferOffset NRI_CALL StreamBufferData(Streamer& streamer, const StreamBufferDataDesc& streamBufferDataDesc) {
     DeviceVal& deviceVal = GetDeviceVal(streamer);
     StreamerVal& streamerVal = (StreamerVal&)streamer;
@@ -1290,6 +2003,14 @@ static BufferOffset NRI_CALL StreamBufferData(Streamer& streamer, const StreamBu
 
     NRI_RETURN_ON_FAILURE(&deviceVal, streamBufferDataDesc.dataChunkNum, {}, "'streamBufferDataDesc.dataChunkNum' must be > 0");
     NRI_RETURN_ON_FAILURE(&deviceVal, streamBufferDataDesc.dataChunks, {}, "'streamBufferDataDesc.dataChunks' is NULL");
+
+    if (streamBufferDataDesc.dstBuffer)
+        NRI_RETURN_ON_FAILURE(&deviceVal, &GetDeviceVal(*streamBufferDataDesc.dstBuffer) == &deviceVal, {}, "'streamBufferDataDesc.dstBuffer' belongs to a different device");
+
+    ExclusiveScope lock(streamerVal.m_Lock);
+
+    if (streamBufferDataDesc.copyBatch || streamBufferDataDesc.dstBuffer)
+        NRI_RETURN_ON_FAILURE(&deviceVal, FindStreamerCopyBatch(streamerVal.m_CopyBatches, streamBufferDataDesc.copyBatch) != SIZE_MAX, {}, "'streamBufferDataDesc.copyBatch' is invalid or inactive");
 
     return streamerImpl->StreamBufferData(streamBufferDataDesc);
 }
@@ -1303,13 +2024,16 @@ static BufferOffset NRI_CALL StreamTextureData(Streamer& streamer, const StreamT
     NRI_RETURN_ON_FAILURE(&deviceVal, streamTextureDataDesc.dataRowPitch, {}, "'streamTextureDataDesc.dataRowPitch' must be > 0");
     NRI_RETURN_ON_FAILURE(&deviceVal, streamTextureDataDesc.dataSlicePitch, {}, "'streamTextureDataDesc.dataSlicePitch' must be > 0");
     NRI_RETURN_ON_FAILURE(&deviceVal, streamTextureDataDesc.data, {}, "'streamTextureDataDesc.data' is NULL");
+    NRI_RETURN_ON_FAILURE(&deviceVal, &GetDeviceVal(*streamTextureDataDesc.dstTexture) == &deviceVal, {}, "'streamTextureDataDesc.dstTexture' belongs to a different device");
 
-    if (streamTextureDataDesc.dstTexture) {
-        constexpr TextureUsageBits attachmentBits = TextureUsageBits::COLOR_ATTACHMENT | TextureUsageBits::DEPTH_STENCIL_ATTACHMENT | TextureUsageBits::SHADING_RATE_ATTACHMENT;
-        const TextureVal& textureVal = *(TextureVal*)streamTextureDataDesc.dstTexture;
-        const TextureDesc& textureDesc = textureVal.GetDesc();
-        NRI_RETURN_ON_FAILURE(&deviceVal, !(textureDesc.usage & attachmentBits), {}, "streaming data into potentially compressed attachments is unrecommended");
-    }
+    ExclusiveScope lock(streamerVal.m_Lock);
+
+    NRI_RETURN_ON_FAILURE(&deviceVal, FindStreamerCopyBatch(streamerVal.m_CopyBatches, streamTextureDataDesc.copyBatch) != SIZE_MAX, {}, "'streamTextureDataDesc.copyBatch' is invalid or inactive");
+
+    constexpr TextureUsageBits attachmentBits = TextureUsageBits::COLOR_ATTACHMENT | TextureUsageBits::DEPTH_STENCIL_ATTACHMENT | TextureUsageBits::SHADING_RATE_ATTACHMENT;
+    const TextureVal& textureVal = *(TextureVal*)streamTextureDataDesc.dstTexture;
+    const TextureDesc& textureDesc = textureVal.GetDesc();
+    NRI_RETURN_ON_FAILURE(&deviceVal, !(textureDesc.usage & attachmentBits), {}, "streaming data into potentially compressed attachments is unrecommended");
 
     return streamerImpl->StreamTextureData(streamTextureDataDesc);
 }
@@ -1317,24 +2041,37 @@ static BufferOffset NRI_CALL StreamTextureData(Streamer& streamer, const StreamT
 static void NRI_CALL EndStreamerFrame(Streamer& streamer) {
     StreamerVal& streamerVal = (StreamerVal&)streamer;
     StreamerImpl* streamerImpl = streamerVal.GetImpl();
+    ExclusiveScope lock(streamerVal.m_Lock);
 
     streamerImpl->EndFrame();
+    streamerVal.m_CopyBatches.clear();
 }
 
-static void NRI_CALL CmdCopyStreamedData(CommandBuffer& commandBuffer, Streamer& streamer) {
+static void NRI_CALL CmdCopyStreamedData(CommandBuffer& commandBuffer, Streamer& streamer, StreamerCopyBatch copyBatch) {
+    DeviceVal& deviceVal = GetDeviceVal(streamer);
     StreamerVal& streamerVal = (StreamerVal&)streamer;
     StreamerImpl* streamerImpl = streamerVal.GetImpl();
+    ExclusiveScope lock(streamerVal.m_Lock);
 
-    streamerImpl->CmdCopyStreamedData(commandBuffer);
+    NRI_RETURN_ON_FAILURE(&deviceVal, &GetDeviceVal(commandBuffer) == &deviceVal, ReturnVoid(), "'commandBuffer' belongs to a different device");
+
+    size_t copyBatchIndex = FindStreamerCopyBatch(streamerVal.m_CopyBatches, copyBatch);
+    NRI_RETURN_ON_FAILURE(&deviceVal, copyBatchIndex != SIZE_MAX, ReturnVoid(), "'copyBatch' is invalid or inactive");
+
+    streamerImpl->CmdCopyStreamedData(commandBuffer, copyBatch);
+    streamerVal.m_CopyBatches[copyBatchIndex] = streamerVal.m_CopyBatches.back();
+    streamerVal.m_CopyBatches.pop_back();
 }
 
 Result DeviceVal::FillFunctionTable(StreamerInterface& table) const {
     table.CreateStreamer = ::CreateStreamer;
     table.DestroyStreamer = ::DestroyStreamer;
+    table.BeginStreamerCopyBatch = ::BeginStreamerCopyBatch;
     table.GetStreamerConstantBuffer = ::GetStreamerConstantBuffer;
     table.StreamBufferData = ::StreamBufferData;
     table.StreamTextureData = ::StreamTextureData;
     table.StreamConstantData = ::StreamConstantData;
+    table.StreamHostData = ::StreamHostData;
     table.EndStreamerFrame = ::EndStreamerFrame;
     table.CmdCopyStreamedData = ::CmdCopyStreamedData;
 
@@ -1367,12 +2104,12 @@ static Result NRI_CALL AcquireNextTexture(SwapChain& swapChain, Fence& acquireSe
     return ((SwapChainVal&)swapChain).AcquireNextTexture(acquireSemaphore, textureIndex);
 }
 
-static Result NRI_CALL WaitForPresent(SwapChain& swapChain) {
-    return ((SwapChainVal&)swapChain).WaitForPresent();
+static Result NRI_CALL WaitForPresent(SwapChain& swapChain, uint64_t presentId) {
+    return ((SwapChainVal&)swapChain).WaitForPresent(presentId);
 }
 
-static Result NRI_CALL QueuePresent(SwapChain& swapChain, Fence& releaseSemaphore) {
-    return ((SwapChainVal&)swapChain).Present(releaseSemaphore);
+static Result NRI_CALL QueuePresent(SwapChain& swapChain, Fence& releaseSemaphore, uint64_t presentId) {
+    return ((SwapChainVal&)swapChain).Present(releaseSemaphore, presentId);
 }
 
 Result DeviceVal::FillFunctionTable(SwapChainInterface& table) const {

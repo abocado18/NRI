@@ -274,7 +274,8 @@ Result DescriptorD3D11::Create(const TextureViewDesc& textureViewDesc) {
 Result DescriptorD3D11::Create(const BufferViewDesc& bufferViewDesc) {
     const BufferD3D11& bufferD3D11 = *(BufferD3D11*)bufferViewDesc.buffer;
     const BufferDesc& bufferDesc = bufferD3D11.GetDesc();
-    uint64_t size = bufferViewDesc.size == WHOLE_SIZE ? bufferDesc.size : bufferViewDesc.size;
+    uint64_t size = bufferViewDesc.size == WHOLE_SIZE ? (bufferDesc.size - bufferViewDesc.offset) : bufferViewDesc.size;
+    m_IsBufferView = true;
 
     Format patchedFormat = Format::UNKNOWN;
     uint32_t structureStride = bufferViewDesc.structureStride ? bufferViewDesc.structureStride : bufferDesc.structureStride;
@@ -286,7 +287,7 @@ Result DescriptorD3D11::Create(const BufferViewDesc& bufferViewDesc) {
         if (bufferViewDesc.offset != 0 && m_Device.GetVersion() == 0)
             NRI_REPORT_ERROR(&m_Device, "Constant buffers with non-zero offsets require 11.1+ feature level!");
     } else if (bufferViewDesc.type == BufferView::STRUCTURED_BUFFER || bufferViewDesc.type == BufferView::STORAGE_STRUCTURED_BUFFER) {
-        if (structureStride != bufferDesc.structureStride || structureStride == 4) {
+        if (bufferDesc.byteAddress) {
             // D3D11 requires "structureStride" passed during creation, but we violate the spec and treat "structured" buffers as "raw" to allow multiple views creation for a single buffer // TODO: this may not work on some HW!
             patchedFormat = Format::R32_UINT;
             isRaw = true;
@@ -341,7 +342,7 @@ Result DescriptorD3D11::Create(const BufferViewDesc& bufferViewDesc) {
     NRI_RETURN_ON_BAD_HRESULT(&m_Device, hr, "ID3D11Device::CreateXxxView");
 
     m_Format = patchedFormat;
-    m_SubresourceInfo.Initialize(&bufferD3D11, elementOffset, elementNum);
+    m_SubresourceInfo.Initialize(&bufferD3D11, (uint32_t)bufferViewDesc.offset, (uint32_t)size);
 
     return Result::SUCCESS;
 }

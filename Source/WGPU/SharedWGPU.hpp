@@ -275,15 +275,15 @@ WGPUTextureUsage nri::GetTextureUsage(TextureUsageBits usage) {
 WGPUBufferUsage nri::GetBufferUsage(BufferUsageBits usage) {
     WGPUBufferUsage result = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst | WGPUBufferUsage_QueryResolve;
 
-    if (usage & BufferUsageBits::VERTEX_BUFFER)
+    if (usage & BufferUsageBits::VERTEX)
         result |= WGPUBufferUsage_Vertex;
-    if (usage & BufferUsageBits::INDEX_BUFFER)
+    if (usage & BufferUsageBits::INDEX)
         result |= WGPUBufferUsage_Index;
-    if (usage & BufferUsageBits::CONSTANT_BUFFER)
+    if (usage & BufferUsageBits::CONSTANT)
         result |= WGPUBufferUsage_Uniform;
     if (usage & (BufferUsageBits::SHADER_RESOURCE | BufferUsageBits::SHADER_RESOURCE_STORAGE))
         result |= WGPUBufferUsage_Storage;
-    if (usage & BufferUsageBits::ARGUMENT_BUFFER)
+    if (usage & BufferUsageBits::ARGUMENT)
         result |= WGPUBufferUsage_Indirect;
 
     return result;
@@ -618,7 +618,7 @@ WGPUComponentSwizzle nri::GetComponentSwizzle(ComponentSwizzle componentSwizzle)
     }
 }
 
-static bool IsColorRenderableWGPU(Format format) {
+static bool IsColorRenderable(Format format) {
     switch (format) {
         case Format::R8_UNORM:
         case Format::RG8_UNORM:
@@ -658,7 +658,7 @@ static bool IsColorRenderableWGPU(Format format) {
     }
 }
 
-static bool IsBlendSupportedWGPU(Format format) {
+static bool IsBlendSupported(Format format) {
     switch (format) {
         case Format::R8_UNORM:
         case Format::RG8_UNORM:
@@ -679,7 +679,7 @@ static bool IsBlendSupportedWGPU(Format format) {
     }
 }
 
-static bool IsStorageTextureSupportedWGPU(Format format) {
+static bool IsStorageTextureSupported(Format format) {
     switch (format) {
         case Format::RGBA8_UNORM:
         case Format::RGBA8_SNORM:
@@ -710,16 +710,19 @@ FormatSupportBits nri::GetFormatSupportWGPU(Format format) {
     const FormatProps& props = GetFormatProps(format);
     FormatSupportBits support = FormatSupportBits::TEXTURE;
 
-    if (IsStorageTextureSupportedWGPU(format))
+    if (!props.isDepth && !props.isStencil)
+        support |= FormatSupportBits::HOST_COPY;
+
+    if (IsStorageTextureSupported(format))
         support |= FormatSupportBits::STORAGE_TEXTURE;
     if (!props.isCompressed && !props.isDepth && !props.isStencil) {
         if (GetVertexFormat(format) != WGPUVertexFormat_Force32)
             support |= FormatSupportBits::VERTEX_BUFFER;
     }
 
-    if (IsColorRenderableWGPU(format))
+    if (IsColorRenderable(format))
         support |= FormatSupportBits::COLOR_ATTACHMENT | FormatSupportBits::MULTISAMPLE_4X | FormatSupportBits::MULTISAMPLE_RESOLVE;
-    if (IsBlendSupportedWGPU(format))
+    if (IsBlendSupported(format))
         support |= FormatSupportBits::BLEND;
     if (props.isDepth || props.isStencil)
         support |= FormatSupportBits::DEPTH_STENCIL_ATTACHMENT;

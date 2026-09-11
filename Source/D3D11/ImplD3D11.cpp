@@ -1,5 +1,7 @@
 // © 2021 NVIDIA Corporation
 
+#include <algorithm>
+
 #include "SharedD3D11.h"
 
 #include "BufferD3D11.h"
@@ -212,19 +214,11 @@ static void NRI_CALL GetTextureMemoryDesc(const Texture& texture, MemoryLocation
 }
 
 static Result NRI_CALL BindBufferMemory(const BindBufferMemoryDesc* bindBufferMemoryDescs, uint32_t bindBufferMemoryDescNum) {
-    if (!bindBufferMemoryDescNum)
-        return Result::SUCCESS;
-
-    DeviceD3D11& deviceD3D11 = ((BufferD3D11*)bindBufferMemoryDescs->buffer)->GetDevice();
-    return deviceD3D11.BindBufferMemory(bindBufferMemoryDescs, bindBufferMemoryDescNum);
+    return BindBufferMemoryD3D11(bindBufferMemoryDescs, bindBufferMemoryDescNum);
 }
 
 static Result NRI_CALL BindTextureMemory(const BindTextureMemoryDesc* bindTextureMemoryDescs, uint32_t bindTextureMemoryDescNum) {
-    if (!bindTextureMemoryDescNum)
-        return Result::SUCCESS;
-
-    DeviceD3D11& deviceD3D11 = ((TextureD3D11*)bindTextureMemoryDescs->texture)->GetDevice();
-    return deviceD3D11.BindTextureMemory(bindTextureMemoryDescs, bindTextureMemoryDescNum);
+    return BindTextureMemoryD3D11(bindTextureMemoryDescs, bindTextureMemoryDescNum);
 }
 
 static void NRI_CALL GetBufferMemoryDesc2(const Device& device, const BufferDesc& bufferDesc, MemoryLocation memoryLocation, MemoryDesc& memoryDesc) {
@@ -526,6 +520,16 @@ static void NRI_CALL UnmapBuffer(Buffer& buffer) {
     ((BufferD3D11&)buffer).Unmap();
 }
 
+static Result NRI_CALL UploadHostMemoryToTexture(Queue& queue, const UploadHostMemoryToTextureDesc* copyDescs, uint32_t copyDescNum) {
+    QueueD3D11& queueD3D11 = (QueueD3D11&)queue;
+    return queueD3D11.GetDevice().UploadHostMemoryToTexture(queueD3D11, copyDescs, copyDescNum);
+}
+
+static Result NRI_CALL ReadbackTextureToHostMemory(Queue& queue, const ReadbackTextureToHostMemoryDesc* copyDescs, uint32_t copyDescNum) {
+    QueueD3D11& queueD3D11 = (QueueD3D11&)queue;
+    return queueD3D11.GetDevice().ReadbackTextureToHostMemory(queueD3D11, copyDescs, copyDescNum);
+}
+
 static uint64_t NRI_CALL GetBufferDeviceAddress(const Buffer&) {
     return 0;
 }
@@ -672,7 +676,8 @@ static void NRI_CALL EmuCmdDrawIndexedIndirect(CommandBuffer& commandBuffer, con
     ((CommandBufferEmuD3D11&)commandBuffer).DrawIndexedIndirect(buffer, offset, drawNum, stride, countBuffer, countBufferOffset);
 }
 
-static void NRI_CALL EmuCmdEndRendering(CommandBuffer&) {
+static void NRI_CALL EmuCmdEndRendering(CommandBuffer& commandBuffer) {
+    ((CommandBufferEmuD3D11&)commandBuffer).EndRendering();
 }
 
 static void NRI_CALL EmuCmdDispatch(CommandBuffer& commandBuffer, const DispatchDesc& dispatchDesc) {
@@ -822,6 +827,8 @@ Result DeviceD3D11::FillFunctionTable(CoreInterface& table) const {
     table.ResetCommandAllocator = ::ResetCommandAllocator;
     table.MapBuffer = ::MapBuffer;
     table.UnmapBuffer = ::UnmapBuffer;
+    table.UploadHostMemoryToTexture = ::UploadHostMemoryToTexture;
+    table.ReadbackTextureToHostMemory = ::ReadbackTextureToHostMemory;
     table.GetBufferDeviceAddress = ::GetBufferDeviceAddress;
     table.SetDebugName = ::SetDebugName;
     table.GetDeviceNativeObject = ::GetDeviceNativeObject;
@@ -990,16 +997,16 @@ static void NRI_CALL DestroyImgui(Imgui* imgui) {
     Destroy((ImguiImpl*)imgui);
 }
 
-static void NRI_CALL CmdCopyImguiData(CommandBuffer& commandBuffer, Streamer& streamer, Imgui& imgui, const CopyImguiDataDesc& copyImguiDataDesc) {
+static void NRI_CALL CmdCopyImguiData(CommandBuffer& commandBuffer, Streamer& streamer, Imgui& imgui, const CopyImguiDataDesc& copyImguiDataDesc, ImguiRenderData& imguiRenderData) {
     ImguiImpl& imguiImpl = (ImguiImpl&)imgui;
 
-    return imguiImpl.CmdCopyData(commandBuffer, streamer, copyImguiDataDesc);
+    return imguiImpl.CmdCopyData(commandBuffer, streamer, copyImguiDataDesc, imguiRenderData);
 }
 
-static void NRI_CALL CmdDrawImgui(CommandBuffer& commandBuffer, Imgui& imgui, const DrawImguiDesc& drawImguiDesc) {
-    ImguiImpl& imguiImpl = (ImguiImpl&)imgui;
+static void NRI_CALL CmdDrawImgui(CommandBuffer& commandBuffer, const ImguiRenderData& imguiRenderData, const DrawImguiDesc& drawImguiDesc) {
+    ImguiImpl& imguiImpl = (ImguiImpl&)*imguiRenderData.imgui;
 
-    return imguiImpl.CmdDraw(commandBuffer, drawImguiDesc);
+    return imguiImpl.CmdDraw(commandBuffer, imguiRenderData, drawImguiDesc);
 }
 
 Result DeviceD3D11::FillFunctionTable(ImguiInterface& table) const {
@@ -1022,12 +1029,12 @@ static Result NRI_CALL SetLatencySleepMode(SwapChain& swapChain, const LatencySl
     return ((SwapChainD3D11&)swapChain).SetLatencySleepMode(latencySleepMode);
 }
 
-static Result NRI_CALL SetLatencyMarker(SwapChain& swapChain, LatencyMarker latencyMarker) {
-    return ((SwapChainD3D11&)swapChain).SetLatencyMarker(latencyMarker);
+static Result NRI_CALL SetLatencyMarker(SwapChain& swapChain, uint64_t presentId, LatencyMarker latencyMarker) {
+    return ((SwapChainD3D11&)swapChain).SetLatencyMarker(presentId, latencyMarker);
 }
 
-static Result NRI_CALL LatencySleep(SwapChain& swapChain) {
-    return ((SwapChainD3D11&)swapChain).LatencySleep();
+static Result NRI_CALL LatencySleep(SwapChain& swapChain, uint64_t presentId) {
+    return ((SwapChainD3D11&)swapChain).LatencySleep(presentId);
 }
 
 static Result NRI_CALL GetLatencyReport(const SwapChain& swapChain, LatencyReport& latencyReport) {
@@ -1069,12 +1076,20 @@ static void NRI_CALL DestroyStreamer(Streamer* streamer) {
     Destroy((StreamerImpl*)streamer);
 }
 
+static StreamerCopyBatch NRI_CALL BeginStreamerCopyBatch(Streamer& streamer) {
+    return ((StreamerImpl&)streamer).BeginCopyBatch();
+}
+
 static Buffer* NRI_CALL GetStreamerConstantBuffer(Streamer& streamer) {
     return ((StreamerImpl&)streamer).GetConstantBuffer();
 }
 
 static uint32_t NRI_CALL StreamConstantData(Streamer& streamer, const void* data, uint32_t dataSize) {
     return ((StreamerImpl&)streamer).StreamConstantData(data, dataSize);
+}
+
+static void* NRI_CALL StreamHostData(Streamer& streamer, const void* data, uint64_t dataSize, uint32_t placementAlignment) {
+    return ((StreamerImpl&)streamer).StreamHostData(data, dataSize, placementAlignment);
 }
 
 static BufferOffset NRI_CALL StreamBufferData(Streamer& streamer, const StreamBufferDataDesc& streamBufferDataDesc) {
@@ -1089,17 +1104,19 @@ static void NRI_CALL EndStreamerFrame(Streamer& streamer) {
     ((StreamerImpl&)streamer).EndFrame();
 }
 
-static void NRI_CALL CmdCopyStreamedData(CommandBuffer& commandBuffer, Streamer& streamer) {
-    ((StreamerImpl&)streamer).CmdCopyStreamedData(commandBuffer);
+static void NRI_CALL CmdCopyStreamedData(CommandBuffer& commandBuffer, Streamer& streamer, StreamerCopyBatch copyBatch) {
+    ((StreamerImpl&)streamer).CmdCopyStreamedData(commandBuffer, copyBatch);
 }
 
 Result DeviceD3D11::FillFunctionTable(StreamerInterface& table) const {
     table.CreateStreamer = ::CreateStreamer;
     table.DestroyStreamer = ::DestroyStreamer;
+    table.BeginStreamerCopyBatch = ::BeginStreamerCopyBatch;
     table.GetStreamerConstantBuffer = ::GetStreamerConstantBuffer;
     table.StreamBufferData = ::StreamBufferData;
     table.StreamTextureData = ::StreamTextureData;
     table.StreamConstantData = ::StreamConstantData;
+    table.StreamHostData = ::StreamHostData;
     table.EndStreamerFrame = ::EndStreamerFrame;
     table.CmdCopyStreamedData = ::CmdCopyStreamedData;
 
@@ -1131,12 +1148,12 @@ static Result NRI_CALL AcquireNextTexture(SwapChain& swapChain, Fence&, uint32_t
     return ((SwapChainD3D11&)swapChain).AcquireNextTexture(textureIndex);
 }
 
-static Result NRI_CALL WaitForPresent(SwapChain& swapChain) {
-    return ((SwapChainD3D11&)swapChain).WaitForPresent();
+static Result NRI_CALL WaitForPresent(SwapChain& swapChain, uint64_t presentId) {
+    return ((SwapChainD3D11&)swapChain).WaitForPresent(presentId);
 }
 
-static Result NRI_CALL QueuePresent(SwapChain& swapChain, Fence&) {
-    return ((SwapChainD3D11&)swapChain).Present();
+static Result NRI_CALL QueuePresent(SwapChain& swapChain, Fence&, uint64_t presentId) {
+    return ((SwapChainD3D11&)swapChain).Present(presentId);
 }
 
 Result DeviceD3D11::FillFunctionTable(SwapChainInterface& table) const {
